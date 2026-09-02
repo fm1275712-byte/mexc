@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 from mexc_client import MexcClient
 import config
 
@@ -11,14 +11,8 @@ class Rebalancer:
     def calculate_targets(
         self,
         selected_coins: List[str],
-        method: str = "equal",
-        include_usdt: bool = False
+        method: str = "equal"
     ) -> Dict[str, float]:
-        """
-        Calculate target percentages.
-        method: "equal" or "marketcap"
-        Returns {'BTC': 25.0, 'ETH': 25.0, ...}
-        """
         if not selected_coins:
             return {}
 
@@ -28,50 +22,35 @@ class Rebalancer:
             pct = 100.0 / len(coins)
             return {c: pct for c in coins}
 
-        # marketcap weighted (using current market price * circulating is hard,
-        # we approximate by current USDT value weight if already held,
-        # otherwise by current price ranking / simple equal if no holdings.
-        # Better approach: use current price as proxy for relative value,
-        # but pure marketcap needs external data.
-        # For simplicity and reliability on MEXC only:
-        # We fetch current prices and weight by 1/price? No.
-        # Real marketcap needs CoinGecko etc.
-        # Practical approach used by many bots: weight by current holding value,
-        # or fall back to equal if no holdings.
-        # Better: use price * a fixed amount, but that's not marketcap.
-        # I'll implement a simple "by current market price rank" or better:
-        # Fetch ticker and use a pseudo weight based on liquidity/volume if available.
-        # Simplest reliable: equal for now + note, OR weight by current portfolio value of those coins.
-
+        # marketcap / by current value in portfolio
         portfolio = self.client.get_portfolio_value()
         assets = portfolio.get('assets', {})
-
-        values = {}
-        for c in coins:
-            values[c] = assets.get(c, {}).get('usdt_value', 0.0)
-
+        values = {c: assets.get(c, {}).get('usdt_value', 0.0) for c in coins}
         total_val = sum(values.values())
         if total_val <= 0:
-            # No holdings yet → fall back to equal
             pct = 100.0 / len(coins)
             return {c: pct for c in coins}
-
         return {c: (v / total_val) * 100 for c, v in values.items()}
 
     def calculate_rebalance(
         self,
-        target_allocations: Dict[str, float],  # {'BTC': 50, 'ETH': 30}
+        target_allocations: Dict[str, float],
         threshold: float = 2.0,
-        min_trade_usdt: float = 5.0
+        min_trade_usdt: float = 5.0,
+        target_investment: float = None
     ) -> Tuple[List[dict], Dict]:
         """
-        Returns (orders_to_execute, portfolio_info)
+        target_investment: if set, we try to work with that size (for new portfolios).
+        Otherwise use full current portfolio value of the selected assets + free USDT.
         """
         portfolio = self.client.get_portfolio_value()
         total = portfolio['total_usdt']
         if total <= 0:
             return [], portfolio
 
+        # If target_investment is given and smaller, we can still rebalance the whole account
+        # for simplicity we rebalance the selected coins relative to their targets
+        # using the full account for now (MEXC doesn't have sub-accounts easily).
         current = portfolio['assets']
         orders = []
 
@@ -88,11 +67,16 @@ class Rebalancer:
 
             current_pct = current.get(asset, {}).get('percent', 0.0)
             target_pct = targets.get(asset, 0.0)
-            diff = target_pct - current_pct
 
+            # Only rebalance assets that are in targets or currently held and in targets context
+            if asset not in targets and current_pct < 0.1:
+                continue
+
+            diff = target_pct - current_pct
             if abs(diff) < threshold:
                 continue
 
+            # Use full account total for percentage calculation
             target_usdt = (target_pct / 100) * total
             current_usdt = current.get(asset, {}).get('usdt_value', 0.0)
             delta_usdt = target_usdt - current_usdt
@@ -168,10 +152,7 @@ class Rebalancer:
                         'filled': result.get('filled')
                     })
             except Exception as e:
-                results['errors'].append({
-                    'order': order,
-                    'error': str(e)
-                })
+                results['errors'].append({'order': order, 'error': str(e)})
 
         results['portfolio_after'] = self.client.get_portfolio_value() if not dry_run else portfolio
         return results
