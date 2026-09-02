@@ -72,6 +72,13 @@ def format_full_balance(portfolio: dict) -> str:
     return "\n".join(lines)
 
 
+def ui_embed(title: str, description: str, color: int = 0x5865F2) -> discord.Embed:
+    """Consistent premium-looking Discord card for every bot screen."""
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_footer(text="MEXC Control Center • اختر إجراءً من الأزرار أدناه")
+    return embed
+
+
 def format_portfolio_detail(p, targets: dict = None, current_value: float = None) -> str:
     coins = [c.symbol for c in p.coins]
     method = "بالتساوي" if p.allocation_method == "equal" else "قيمة سوقية"
@@ -177,7 +184,10 @@ class MainMenuView(discord.ui.View):
                 f"• حد أدنى للصفقة: `{user.min_trade_usdt}$`\n"
                 f"• أقصى عملات/محفظة: `{user.max_coins_per_portfolio}`\n"
             )
-            await interaction.response.send_message(text, view=GlobalSettingsView(user), ephemeral=True)
+            await interaction.response.send_message(
+                embed=ui_embed("⚙️ الإعدادات العامة", text, 0x5865F2),
+                view=GlobalSettingsView(user), ephemeral=True
+            )
         finally:
             db.close()
 
@@ -185,6 +195,7 @@ class MainMenuView(discord.ui.View):
 class CreatePortfolioView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=120)
+        self.add_item(BackToMainButton())
 
     @discord.ui.button(label="إنشاء محفظة جديدة", style=discord.ButtonStyle.success)
     async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -305,7 +316,10 @@ class PortfolioButton(discord.ui.Button):
             targets = get_rebalancer().calculate_targets([c.symbol for c in p.coins], p.allocation_method)
             current = get_mexc().get_coins_value([c.symbol for c in p.coins])
             text = format_portfolio_detail(p, targets, current["total_usdt"])
-            await interaction.response.send_message(text, view=PortfolioMenuView(p.id), ephemeral=True)
+            await interaction.response.send_message(
+                embed=ui_embed(f"📁 {p.name}", text, 0x57F287 if p.is_running else 0x5865F2),
+                view=PortfolioMenuView(p.id), ephemeral=True
+            )
         finally:
             db.close()
 
@@ -382,6 +396,7 @@ class PortfolioMenuView(discord.ui.View):
         super().__init__(timeout=300)
         self.portfolio_id = portfolio_id
         self.add_item(PortfolioCopyButton(portfolio_id))
+        self.add_item(BackToMainButton())
 
     @discord.ui.button(label="تشغيل الاستراتيجية", style=discord.ButtonStyle.success, emoji="▶️", row=0)
     async def start_strategy(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -668,6 +683,7 @@ class RebalanceView(discord.ui.View):
     def __init__(self, portfolio_id: int):
         super().__init__(timeout=180)
         self.portfolio_id = portfolio_id
+        self.add_item(BackToMainButton())
 
     @discord.ui.button(label="معاينة (Dry Run)", style=discord.ButtonStyle.secondary, emoji="🔍")
     async def dry(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -736,6 +752,7 @@ class CoinsManageView(discord.ui.View):
     def __init__(self, portfolio_id: int):
         super().__init__(timeout=180)
         self.portfolio_id = portfolio_id
+        self.add_item(BackToMainButton())
 
     @discord.ui.button(label="إضافة عملة", style=discord.ButtonStyle.success, emoji="🔍")
     async def add_coin(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -901,7 +918,10 @@ async def start_cmd(interaction: discord.Interaction):
         "• زيادة استثمار / إعادة توازن / إدارة عملات\n"
         "• يحترم المبلغ المخصص لكل محفظة"
     )
-    await interaction.response.send_message(text, view=MainMenuView(), ephemeral=True)
+    await interaction.response.send_message(
+        embed=ui_embed("MEXC • مركز التحكم", text, 0x2B2D31),
+        view=MainMenuView(), ephemeral=True
+    )
 
 
 @bot.tree.command(name="portfolios", description="عرض محافظك النشطة")
