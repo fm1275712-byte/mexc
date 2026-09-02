@@ -70,7 +70,24 @@ class RebalanceLog(Base):
 
 
 def init_db():
+    """Create tables if they don't exist + auto-migrate old telegram_id columns."""
     Base.metadata.create_all(bind=engine)
+
+    # Auto-fix: rename telegram_id → discord_id if the old column still exists
+    from sqlalchemy import text, inspect
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table in ("user_settings", "portfolios", "rebalance_logs"):
+            if table not in insp.get_table_names():
+                continue
+            cols = [c["name"] for c in insp.get_columns(table)]
+            if "telegram_id" in cols and "discord_id" not in cols:
+                conn.execute(text(f'ALTER TABLE {table} RENAME COLUMN telegram_id TO discord_id'))
+                print(f"[migration] Renamed {table}.telegram_id → discord_id")
+            elif "telegram_id" in cols and "discord_id" in cols:
+                # both exist → drop the old one
+                conn.execute(text(f'ALTER TABLE {table} DROP COLUMN telegram_id'))
+                print(f"[migration] Dropped leftover {table}.telegram_id")
 
 
 def get_or_create_user(db, discord_id: int):
