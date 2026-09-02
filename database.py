@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, BigInteger, ForeignKey, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, BigInteger, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
 import config
@@ -9,15 +9,14 @@ Base = declarative_base()
 
 
 class UserSettings(Base):
-    """Global defaults for the user"""
     __tablename__ = "user_settings"
 
     id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    discord_id = Column(BigInteger, unique=True, index=True, nullable=False)
     default_threshold = Column(Float, default=2.0)
     default_interval_hours = Column(Integer, default=24)
-    default_allocation_method = Column(String(20), default="equal")  # equal | marketcap
-    default_rebalance_mode = Column(String(20), default="threshold")  # threshold | time
+    default_allocation_method = Column(String(20), default="equal")
+    default_rebalance_mode = Column(String(20), default="threshold")
     min_trade_usdt = Column(Float, default=5.0)
     max_coins_per_portfolio = Column(Integer, default=10)
     min_usdt_per_coin = Column(Float, default=5.0)
@@ -26,11 +25,10 @@ class UserSettings(Base):
 
 
 class Portfolio(Base):
-    """Independent portfolio"""
     __tablename__ = "portfolios"
 
     id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(BigInteger, index=True, nullable=False)
+    discord_id = Column(BigInteger, index=True, nullable=False)
     name = Column(String(100), nullable=False)
     investment_usdt = Column(Float, default=0.0)
     status = Column(String(20), default="active")
@@ -63,7 +61,7 @@ class RebalanceLog(Base):
     __tablename__ = "rebalance_logs"
 
     id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(BigInteger, index=True)
+    discord_id = Column(BigInteger, index=True)
     portfolio_id = Column(Integer, nullable=True)
     action = Column(String(50))
     details = Column(Text)
@@ -71,76 +69,39 @@ class RebalanceLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-def ensure_schema():
-    """يضيف الأعمدة الناقصة أوتوماتيك لو الجدول موجود قديم"""
-    with engine.begin() as conn:
-        # user_settings
-        conn.execute(text("""
-            ALTER TABLE IF EXISTS user_settings
-            ADD COLUMN IF NOT EXISTS default_threshold DOUBLE PRECISION DEFAULT 2.0,
-            ADD COLUMN IF NOT EXISTS default_interval_hours INTEGER DEFAULT 24,
-            ADD COLUMN IF NOT EXISTS default_allocation_method VARCHAR(20) DEFAULT 'equal',
-            ADD COLUMN IF NOT EXISTS default_rebalance_mode VARCHAR(20) DEFAULT 'threshold',
-            ADD COLUMN IF NOT EXISTS min_trade_usdt DOUBLE PRECISION DEFAULT 5.0,
-            ADD COLUMN IF NOT EXISTS max_coins_per_portfolio INTEGER DEFAULT 10,
-            ADD COLUMN IF NOT EXISTS min_usdt_per_coin DOUBLE PRECISION DEFAULT 5.0;
-        """))
-
-        # portfolios
-        conn.execute(text("""
-            ALTER TABLE IF EXISTS portfolios
-            ADD COLUMN IF NOT EXISTS allocation_method VARCHAR(20) DEFAULT 'equal',
-            ADD COLUMN IF NOT EXISTS rebalance_mode VARCHAR(20) DEFAULT 'threshold',
-            ADD COLUMN IF NOT EXISTS threshold DOUBLE PRECISION DEFAULT 2.0,
-            ADD COLUMN IF NOT EXISTS rebalance_interval_hours INTEGER DEFAULT 24,
-            ADD COLUMN IF NOT EXISTS last_rebalance TIMESTAMP,
-            ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP;
-        """))
-
-
 def init_db():
     Base.metadata.create_all(bind=engine)
-    ensure_schema()
-    print("DB schema ensured")
 
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-def get_or_create_user(db, telegram_id: int):
-    user = db.query(UserSettings).filter(UserSettings.telegram_id == telegram_id).first()
+def get_or_create_user(db, discord_id: int):
+    user = db.query(UserSettings).filter(UserSettings.discord_id == discord_id).first()
     if not user:
-        user = UserSettings(telegram_id=telegram_id)
+        user = UserSettings(discord_id=discord_id)
         db.add(user)
         db.commit()
         db.refresh(user)
     return user
 
 
-def get_portfolios(db, telegram_id: int, status: str = "active"):
-    q = db.query(Portfolio).filter(Portfolio.telegram_id == telegram_id)
+def get_portfolios(db, discord_id: int, status: str = "active"):
+    q = db.query(Portfolio).filter(Portfolio.discord_id == discord_id)
     if status:
         q = q.filter(Portfolio.status == status)
     return q.order_by(Portfolio.created_at.desc()).all()
 
 
-def get_portfolio(db, portfolio_id: int, telegram_id: int = None):
+def get_portfolio(db, portfolio_id: int, discord_id: int = None):
     q = db.query(Portfolio).filter(Portfolio.id == portfolio_id)
-    if telegram_id:
-        q = q.filter(Portfolio.telegram_id == telegram_id)
+    if discord_id:
+        q = q.filter(Portfolio.discord_id == discord_id)
     return q.first()
 
 
-def create_portfolio(db, telegram_id: int, name: str, investment: float, coins: list,
+def create_portfolio(db, discord_id: int, name: str, investment: float, coins: list,
                      allocation_method: str = "equal", rebalance_mode: str = "threshold",
                      threshold: float = 2.0, interval: int = 24) -> Portfolio:
     p = Portfolio(
-        telegram_id=telegram_id,
+        discord_id=discord_id,
         name=name,
         investment_usdt=investment,
         allocation_method=allocation_method,
@@ -161,7 +122,7 @@ def create_portfolio(db, telegram_id: int, name: str, investment: float, coins: 
 def add_coin_to_portfolio(db, portfolio_id: int, symbol: str, max_coins: int = 10) -> tuple:
     p = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
     if not p:
-        return False, "المحفظة غير موجودة"
+        return False, f"`{symbol}` المحفظة غير موجودة"
     symbols = [c.symbol for c in p.coins]
     symbol = symbol.upper()
     if symbol in symbols:
@@ -190,9 +151,9 @@ def close_portfolio(db, portfolio_id: int):
         db.commit()
 
 
-def log_action(db, telegram_id: int, action: str, details: str, success: bool = True, portfolio_id: int = None):
+def log_action(db, discord_id: int, action: str, details: str, success: bool = True, portfolio_id: int = None):
     log = RebalanceLog(
-        telegram_id=telegram_id,
+        discord_id=discord_id,
         portfolio_id=portfolio_id,
         action=action,
         details=details,

@@ -1,55 +1,53 @@
+"""
+MEXC Multi-Portfolio Rebalancer - Discord Bot
+"""
 import logging
+import asyncio
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
-    ConversationHandler, ContextTypes, filters
-)
+from typing import Optional
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
 import config
 from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
     create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
-    close_portfolio, log_action, Portfolio, PortfolioCoin
+    close_portfolio, log_action
 )
 from mexc_client import MexcClient
 from rebalancer import Rebalancer
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# States
-(
-    WAIT_PORTFOLIO_NAME,
-    WAIT_INVESTMENT,
-    WAIT_SEARCH_COIN,
-    WAIT_THRESHOLD,
-    WAIT_INTERVAL,
-    WAIT_MIN_TRADE,
-    WAIT_MAX_COINS,
-    WAIT_ADD_COIN_TO_PF,
-) = range(8)
+intents = discord.Intents.default()
+intents.message_content = True
 
-mexc = None
-rebalancer = None
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+mexc_client = None
+rebalancer_inst = None
 
 
 def get_mexc():
-    global mexc
-    if mexc is None:
-        mexc = MexcClient()
-    return mexc
+    global mexc_client
+    if mexc_client is None:
+        mexc_client = MexcClient()
+    return mexc_client
 
 
 def get_rebalancer():
-    global rebalancer
-    if rebalancer is None:
-        rebalancer = Rebalancer(get_mexc())
-    return rebalancer
+    global rebalancer_inst
+    if rebalancer_inst is None:
+        rebalancer_inst = Rebalancer(get_mexc())
+    return rebalancer_inst
 
 
 def is_authorized(user_id: int) -> bool:
-    if config.ADMIN_TELEGRAM_ID:
-        return str(user_id) == str(config.ADMIN_TELEGRAM_ID)
+    if config.ADMIN_DISCORD_ID:
+        return str(user_id) == str(config.ADMIN_DISCORD_ID)
     return True
 
 
@@ -58,98 +56,29 @@ def is_coin_available(symbol: str) -> bool:
         pair = f"{symbol.upper()}/USDT"
         markets = get_mexc().exchange.load_markets()
         m = markets.get(pair)
-        return bool(m and m.get('active', True) and m.get('spot', True))
+        return bool(m and m.get("active", True) and m.get("spot", True))
     except Exception:
         return False
-
-
-# ==================== KEYBOARDS ====================
-
-def main_menu_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📁 محافظي", callback_data="my_portfolios")],
-        [InlineKeyboardButton("➕ إنشاء محفظة جديدة", callback_data="create_portfolio")],
-        [InlineKeyboardButton("📊 رصيد الحساب الكامل", callback_data="full_balance")],
-        [InlineKeyboardButton("🚨 بيع الكل (طوارئ)", callback_data="emergency_sell")],
-        [InlineKeyboardButton("⚙️ الإعدادات العامة", callback_data="global_settings")],
-        [InlineKeyboardButton("📜 السجل", callback_data="logs")],
-    ])
-
-
-def portfolios_list_kb(portfolios):
-    buttons = []
-    for p in portfolios:
-        status = "🟢" if p.status == "active" else "🔴"
-        buttons.append([InlineKeyboardButton(
-            f"{status} {p.name} ({p.investment_usdt:.0f}$)",
-            callback_data=f"pf_{p.id}"
-        )])
-    buttons.append([InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def portfolio_menu_kb(pf_id):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ تشغيل (شراء)", callback_data=f"pfstart_{pf_id}")],
-        [InlineKeyboardButton("📉 صافي الربح / الخسارة", callback_data=f"pfpnl_{pf_id}")],
-        [InlineKeyboardButton("📋 تفاصيل المحفظة", callback_data=f"pfdetail_{pf_id}")],
-        [InlineKeyboardButton("🪙 العملات", callback_data=f"pfcoins_{pf_id}")],
-        [InlineKeyboardButton("💰 زيادة الاستثمار", callback_data=f"pfincrease_{pf_id}")],
-        [InlineKeyboardButton("⚖️ إعادة التوازن", callback_data=f"pfrebalance_{pf_id}")],
-        [InlineKeyboardButton("⚙️ إعدادات المحفظة", callback_data=f"pfsettings_{pf_id}")],
-        [InlineKeyboardButton("🛑 بيع رصيد المحفظة", callback_data=f"pfclose_{pf_id}")],
-        [InlineKeyboardButton("🔙 محافظي", callback_data="my_portfolios")],
-    ])
-
-
-def pf_coins_kb(pf_id):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 إضافة عملة", callback_data=f"pfaddcoin_{pf_id}")],
-        [InlineKeyboardButton("🗑️ حذف عملة", callback_data=f"pfremovecoin_{pf_id}")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data=f"pf_{pf_id}")],
-    ])
-
-
-def rebalance_pf_kb(pf_id):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 معاينة", callback_data=f"pfdry_{pf_id}")],
-        [InlineKeyboardButton("✅ تنفيذ", callback_data=f"pfreal_{pf_id}")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data=f"pf_{pf_id}")],
-    ])
-
-
-def global_settings_kb(user):
-    method = "بالتساوي" if user.default_allocation_method == "equal" else "قيمة سوقية"
-    mode = "نسبي %" if user.default_rebalance_mode == "threshold" else "بالوقت"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"طريقة التوزيع الافتراضية: {method}", callback_data="gs_method")],
-        [InlineKeyboardButton(f"وضع الانحراف الافتراضي: {mode}", callback_data="gs_mode")],
-        [InlineKeyboardButton(f"Threshold: {user.default_threshold}%", callback_data="gs_threshold")],
-        [InlineKeyboardButton(f"الفترة: {user.default_interval_hours}س", callback_data="gs_interval")],
-        [InlineKeyboardButton(f"حد أدنى للصفقة: {user.min_trade_usdt}$", callback_data="gs_mintrade")],
-        [InlineKeyboardButton(f"أقصى عملات/محفظة: {user.max_coins_per_portfolio}", callback_data="gs_maxcoins")],
-        [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu")],
-    ])
 
 
 # ==================== HELPERS ====================
 
 def format_full_balance(portfolio: dict) -> str:
-    if portfolio['total_usdt'] <= 0:
+    if portfolio["total_usdt"] <= 0:
         return "الحساب فارغ حالياً."
-    lines = [f"💰 **إجمالي الحساب:** `{portfolio['total_usdt']:.4f} USDT`\n"]
-    sorted_assets = sorted(portfolio['assets'].items(), key=lambda x: x[1]['usdt_value'], reverse=True)
+    lines = [f"**إجمالي الحساب:** `{portfolio['total_usdt']:.4f} USDT`\n"]
+    sorted_assets = sorted(portfolio["assets"].items(), key=lambda x: x[1]["usdt_value"], reverse=True)
     for asset, data in sorted_assets:
         lines.append(f"• `{asset}`: {data['amount']:.6f} ≈ `{data['usdt_value']:.4f}$` ({data['percent']:.2f}%)")
     return "\n".join(lines)
 
 
-def format_portfolio_detail(p: Portfolio, targets: dict = None) -> str:
+def format_portfolio_detail(p, targets: dict = None) -> str:
     coins = [c.symbol for c in p.coins]
     method = "بالتساوي" if p.allocation_method == "equal" else "قيمة سوقية"
     mode = "نسبي %" if p.rebalance_mode == "threshold" else "بالوقت"
     lines = [
-        f"📁 **{p.name}**",
+        f"**{p.name}**",
         f"الحالة: {'🟢 نشطة' if p.status == 'active' else '🔴 منتهية'}",
         f"الاستثمار المستهدف: `{p.investment_usdt:.2f} USDT`",
         f"عدد العملات: {len(coins)}",
@@ -158,7 +87,7 @@ def format_portfolio_detail(p: Portfolio, targets: dict = None) -> str:
         f"Threshold: {p.threshold}%",
         f"الفترة: {p.rebalance_interval_hours} ساعة",
         "",
-        "**العملات:**"
+        "**العملات:**",
     ]
     if targets:
         for s in coins:
@@ -169,835 +98,555 @@ def format_portfolio_detail(p: Portfolio, targets: dict = None) -> str:
     return "\n".join(lines)
 
 
-# ==================== HANDLERS ====================
+# ==================== VIEWS (BUTTONS) ====================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_authorized(user.id):
-        await update.message.reply_text("غير مصرح.")
-        return
-    db = SessionLocal()
-    try:
-        get_or_create_user(db, user.id)
-    finally:
-        db.close()
+class MainMenuView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
 
-    text = (
-        f"مرحباً {user.first_name} 👋\n\n"
-        "بوت **محافظ MEXC المتعددة**\n\n"
-        "• أنشئ محافظ منفصلة\n"
-        "• كل محفظة لها عملاتها وإعداداتها واستثمارها\n"
-        "• تحكم كامل في كل محفظة (إضافة/حذف عملات، زيادة استثمار، إعادة توازن، إنهاء)\n"
-        "• الحد الأدنى 5$ لكل عملة\n"
-    )
-    await update.message.reply_text(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    if not is_authorized(user_id):
-        await query.edit_message_text("غير مصرح.")
-        return
-
-    data = query.data
-    db = SessionLocal()
-
-    try:
-        user = get_or_create_user(db, user_id)
-
-        if data == "main_menu":
-            await query.edit_message_text("القائمة الرئيسية:", reply_markup=main_menu_kb())
+    @discord.ui.button(label="محافظي", style=discord.ButtonStyle.primary, emoji="📁")
+    async def my_portfolios(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("غير مصرح.", ephemeral=True)
             return
-
-        # ===== FULL BALANCE =====
-        if data == "full_balance":
-            try:
-                bal = get_mexc().get_portfolio_value()
-                text = format_full_balance(bal)
-                await query.edit_message_text(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
-            except Exception as e:
-                await query.edit_message_text(f"خطأ: `{e}`", reply_markup=main_menu_kb(), parse_mode="Markdown")
-            return
-
-        # ===== EMERGENCY SELL ALL =====
-        if data == "emergency_sell":
-            try:
-                bal = get_mexc().get_portfolio_value()
-                assets = {k: v for k, v in bal.get('assets', {}).items() if k != 'USDT' and v.get('usdt_value', 0) > 0.5}
-                if not assets:
-                    await query.edit_message_text("لا توجد أصول للبيع (كل شيء USDT).", reply_markup=main_menu_kb())
-                    return
-                lines = ["🚨 **بيع الكل (طوارئ)**\n", "سيتم بيع الأصول التالية إلى USDT:\n"]
-                total = 0
-                for a, d in sorted(assets.items(), key=lambda x: -x[1]['usdt_value']):
-                    lines.append(f"• `{a}`: {d['amount']:.6f} ≈ `{d['usdt_value']:.2f}$`")
-                    total += d['usdt_value']
-                lines.append(f"\n**الإجمالي التقريبي:** `{total:.2f} USDT`")
-                lines.append("\n⚠️ هذا الإجراء لا يمكن التراجع عنه.")
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ تأكيد بيع الكل", callback_data="emergency_sell_confirm")],
-                    [InlineKeyboardButton("❌ إلغاء", callback_data="main_menu")],
-                ])
-                await query.edit_message_text("\n".join(lines), reply_markup=kb, parse_mode="Markdown")
-            except Exception as e:
-                await query.edit_message_text(f"خطأ: `{e}`", reply_markup=main_menu_kb(), parse_mode="Markdown")
-            return
-
-        if data == "emergency_sell_confirm":
-            await query.edit_message_text("⏳ جاري بيع جميع الأصول إلى USDT...")
-            try:
-                client = get_mexc()
-                bal = client.get_portfolio_value()
-                results = []
-                errors = []
-                for asset, data in bal.get('assets', {}).items():
-                    if asset == 'USDT' or data.get('amount', 0) <= 0:
-                        continue
-                    amount = data['amount'] * 0.999  # leave tiny dust
-                    if data.get('usdt_value', 0) < 0.5:
-                        continue
-                    try:
-                        order = client.create_market_order(f"{asset}/USDT", "sell", amount)
-                        results.append(f"✅ `{asset}`: {amount:.6f}")
-                    except Exception as e:
-                        errors.append(f"❌ `{asset}`: {str(e)[:80]}")
-                lines = ["🚨 **نتيجة بيع الكل:**\n"]
-                lines.extend(results if results else ["لم يتم بيع أي شيء."])
-                if errors:
-                    lines.append("\n**أخطاء:**")
-                    lines.extend(errors)
-                # refresh balance
-                try:
-                    new_bal = client.get_portfolio_value()
-                    lines.append(f"\n💰 الرصيد بعد البيع: `{new_bal['total_usdt']:.2f} USDT`")
-                except Exception:
-                    pass
-                db = SessionLocal()
-                try:
-                    log_action(db, user_id, "emergency_sell", f"sold {len(results)} assets", success=len(errors)==0)
-                finally:
-                    db.close()
-                await query.edit_message_text("\n".join(lines), reply_markup=main_menu_kb(), parse_mode="Markdown")
-            except Exception as e:
-                await query.edit_message_text(f"فشل البيع: `{e}`", reply_markup=main_menu_kb(), parse_mode="Markdown")
-            return
-
-        # ===== MY PORTFOLIOS =====
-        if data == "my_portfolios":
-            pfs = get_portfolios(db, user_id, status="active")
+        db = SessionLocal()
+        try:
+            pfs = get_portfolios(db, interaction.user.id, status="active")
             if not pfs:
-                await query.edit_message_text(
-                    "لا توجد محافظ نشطة.\nأنشئ محفظة جديدة.",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("➕ إنشاء محفظة", callback_data="create_portfolio")],
-                        [InlineKeyboardButton("🔙 الرئيسية", callback_data="main_menu")],
-                    ])
+                view = discord.ui.View()
+                view.add_item(discord.ui.Button(label="إنشاء محفظة", style=discord.ButtonStyle.success, custom_id="create_pf"))
+                await interaction.response.send_message("لا توجد محافظ نشطة.", view=CreatePortfolioView(), ephemeral=True)
+                return
+            view = PortfoliosListView(pfs)
+            await interaction.response.send_message("محافظك النشطة:", view=view, ephemeral=True)
+        finally:
+            db.close()
+
+    @discord.ui.button(label="إنشاء محفظة", style=discord.ButtonStyle.success, emoji="➕")
+    async def create_pf(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("غير مصرح.", ephemeral=True)
+            return
+        await interaction.response.send_modal(CreatePortfolioModal())
+
+    @discord.ui.button(label="رصيد الحساب", style=discord.ButtonStyle.secondary, emoji="📊")
+    async def full_balance(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("غير مصرح.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            bal = get_mexc().get_portfolio_value()
+            text = format_full_balance(bal)
+            await interaction.followup.send(text, ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"خطأ: `{e}`", ephemeral=True)
+
+    @discord.ui.button(label="الإعدادات العامة", style=discord.ButtonStyle.secondary, emoji="⚙️")
+    async def settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("غير مصرح.", ephemeral=True)
+            return
+        db = SessionLocal()
+        try:
+            user = get_or_create_user(db, interaction.user.id)
+            method = "بالتساوي" if user.default_allocation_method == "equal" else "قيمة سوقية"
+            mode = "نسبي %" if user.default_rebalance_mode == "threshold" else "بالوقت"
+            text = (
+                f"**الإعدادات العامة**\n\n"
+                f"• طريقة التوزيع: `{method}`\n"
+                f"• وضع الانحراف: `{mode}`\n"
+                f"• Threshold: `{user.default_threshold}%`\n"
+                f"• الفترة: `{user.default_interval_hours}` ساعة\n"
+                f"• حد أدنى للصفقة: `{user.min_trade_usdt}$`\n"
+                f"• أقصى عملات/محفظة: `{user.max_coins_per_portfolio}`\n"
+            )
+            await interaction.response.send_message(text, view=GlobalSettingsView(user), ephemeral=True)
+        finally:
+            db.close()
+
+
+class CreatePortfolioView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="إنشاء محفظة جديدة", style=discord.ButtonStyle.success)
+    async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(CreatePortfolioModal())
+
+
+class CreatePortfolioModal(discord.ui.Modal, title="إنشاء محفظة جديدة"):
+    name = discord.ui.TextInput(label="اسم المحفظة", placeholder="مثلاً: محفظة الذكاء الاصطناعي", max_length=80)
+    investment = discord.ui.TextInput(label="مبلغ الاستثمار (USDT)", placeholder="مثلاً: 50", max_length=20)
+    coins = discord.ui.TextInput(
+        label="العملات (مفصولة بمسافة أو فاصلة)",
+        placeholder="BTC ETH ONDO HBAR",
+        style=discord.TextStyle.paragraph,
+        max_length=200
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            inv = float(str(self.investment.value).strip())
+            if inv < 5:
+                await interaction.followup.send("الحد الأدنى للاستثمار 5 USDT.", ephemeral=True)
+                return
+        except ValueError:
+            await interaction.followup.send("مبلغ الاستثمار غير صحيح.", ephemeral=True)
+            return
+
+        raw = str(self.coins.value).replace(",", " ").replace("،", " ")
+        symbols = [s.strip().upper() for s in raw.split() if s.strip()]
+        if not symbols:
+            await interaction.followup.send("أضف عملة واحدة على الأقل.", ephemeral=True)
+            return
+
+        # Live check
+        valid = []
+        invalid = []
+        for s in symbols:
+            if is_coin_available(s):
+                valid.append(s)
+            else:
+                invalid.append(s)
+
+        if not valid:
+            await interaction.followup.send(f"كل العملات غير متاحة على MEXC: {', '.join(invalid)}", ephemeral=True)
+            return
+
+        db = SessionLocal()
+        try:
+            user = get_or_create_user(db, interaction.user.id)
+            if len(valid) > user.max_coins_per_portfolio:
+                await interaction.followup.send(f"أقصى عدد عملات = {user.max_coins_per_portfolio}", ephemeral=True)
+                return
+            min_needed = user.min_usdt_per_coin * len(valid)
+            if inv < min_needed:
+                await interaction.followup.send(
+                    f"المبلغ قليل. الحد الأدنى لـ {len(valid)} عملات = {min_needed}$",
+                    ephemeral=True
                 )
                 return
-            await query.edit_message_text("محافظك النشطة:", reply_markup=portfolios_list_kb(pfs))
-            return
 
-        # ===== CREATE PORTFOLIO START =====
-        if data == "create_portfolio":
-            context.user_data.clear()
-            context.user_data['creating'] = True
-            context.user_data['coins'] = []
-            await query.edit_message_text(
-                "📁 **إنشاء محفظة جديدة**\n\nأرسل اسم المحفظة (مثلاً: محفظة الذكاء الاصطناعي):\nأو /cancel",
-                parse_mode="Markdown"
+            p = create_portfolio(
+                db, interaction.user.id, str(self.name.value)[:80], inv, valid,
+                allocation_method=user.default_allocation_method,
+                rebalance_mode=user.default_rebalance_mode,
+                threshold=user.default_threshold,
+                interval=user.default_interval_hours
             )
-            return WAIT_PORTFOLIO_NAME
+            msg = f"✅ تم إنشاء محفظة **{p.name}**\nالاستثمار: `{p.investment_usdt}$`\nالعملات: {', '.join(valid)}"
+            if invalid:
+                msg += f"\n\n⚠️ تم تجاهل (غير متاحة): {', '.join(invalid)}"
+            await interaction.followup.send(msg, view=PortfolioMenuView(p.id), ephemeral=True)
+        finally:
+            db.close()
 
-        # ===== OPEN PORTFOLIO =====
-        if data.startswith("pf_") and not data.startswith("pfdetail_") and not data.startswith("pfcoins_") \
-                and not data.startswith("pfincrease_") and not data.startswith("pfrebalance_") \
-                and not data.startswith("pfsettings_") and not data.startswith("pfclose_") \
-                and not data.startswith("pfaddcoin_") and not data.startswith("pfremovecoin_") \
-                and not data.startswith("pfdry_") and not data.startswith("pfreal_") \
-                and not data.startswith("pfdel_") and not data.startswith("pfstart_") and not data.startswith("pfpnl_"):
-            pf_id = int(data.split("_")[1])
-            p = get_portfolio(db, pf_id, user_id)
+
+class PortfoliosListView(discord.ui.View):
+    def __init__(self, portfolios):
+        super().__init__(timeout=300)
+        for p in portfolios[:20]:
+            self.add_item(PortfolioButton(p))
+
+
+class PortfolioButton(discord.ui.Button):
+    def __init__(self, portfolio):
+        super().__init__(
+            label=f"{portfolio.name} ({portfolio.investment_usdt:.0f}$)",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"open_pf_{portfolio.id}"
+        )
+        self.portfolio_id = portfolio.id
+
+    async def callback(self, interaction: discord.Interaction):
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
             if not p:
-                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_kb())
+                await interaction.response.send_message("المحفظة غير موجودة.", ephemeral=True)
                 return
-            await query.edit_message_text(
+            await interaction.response.send_message(
                 f"المحفظة: **{p.name}**",
-                reply_markup=portfolio_menu_kb(pf_id),
-                parse_mode="Markdown"
+                view=PortfolioMenuView(p.id),
+                ephemeral=True
             )
-            return
+        finally:
+            db.close()
 
-        # ===== PORTFOLIO DETAIL =====
-        if data.startswith("pfdetail_"):
-            pf_id = int(data.split("_")[1])
-            p = get_portfolio(db, pf_id, user_id)
+
+class PortfolioMenuView(discord.ui.View):
+    def __init__(self, portfolio_id: int):
+        super().__init__(timeout=300)
+        self.portfolio_id = portfolio_id
+
+    @discord.ui.button(label="تفاصيل", style=discord.ButtonStyle.secondary, emoji="📋")
+    async def detail(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
             if not p:
-                await query.edit_message_text("غير موجودة.", reply_markup=main_menu_kb())
+                await interaction.response.send_message("غير موجودة.", ephemeral=True)
                 return
             symbols = [c.symbol for c in p.coins]
             targets = get_rebalancer().calculate_targets(symbols, p.allocation_method)
             text = format_portfolio_detail(p, targets)
-            await query.edit_message_text(text, reply_markup=portfolio_menu_kb(pf_id), parse_mode="Markdown")
-            return
+            await interaction.response.send_message(text, view=PortfolioMenuView(self.portfolio_id), ephemeral=True)
+        finally:
+            db.close()
 
-        # ===== PORTFOLIO COINS =====
-        if data.startswith("pfcoins_"):
-            pf_id = int(data.split("_")[1])
-            p = get_portfolio(db, pf_id, user_id)
+    @discord.ui.button(label="العملات", style=discord.ButtonStyle.secondary, emoji="🪙")
+    async def coins(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
             if not p:
+                await interaction.response.send_message("غير موجودة.", ephemeral=True)
                 return
             symbols = [c.symbol for c in p.coins]
-            text = f"**عملات محفظة {p.name}:**\n\n" + ("\n".join(f"• `{s}`" for s in symbols) if symbols else "لا توجد عملات")
-            await query.edit_message_text(text, reply_markup=pf_coins_kb(pf_id), parse_mode="Markdown")
-            return
+            text = f"**عملات {p.name}:**\n" + ("\n".join(f"• `{s}`" for s in symbols) if symbols else "لا توجد")
+            await interaction.response.send_message(text, view=CoinsManageView(self.portfolio_id), ephemeral=True)
+        finally:
+            db.close()
 
-        if data.startswith("pfaddcoin_"):
-            pf_id = int(data.split("_")[1])
-            context.user_data['add_to_pf'] = pf_id
-            await query.edit_message_text(
-                "أرسل رمز العملة لإضافتها (مثل ONDO):\nأو /cancel"
-            )
-            return WAIT_ADD_COIN_TO_PF
+    @discord.ui.button(label="زيادة استثمار", style=discord.ButtonStyle.primary, emoji="💰")
+    async def increase(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(IncreaseInvestmentModal(self.portfolio_id))
 
-        if data.startswith("pfremovecoin_"):
-            pf_id = int(data.split("_")[1])
-            p = get_portfolio(db, pf_id, user_id)
+    @discord.ui.button(label="إعادة توازن", style=discord.ButtonStyle.success, emoji="⚖️")
+    async def rebalance(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "إعادة توازن المحفظة:",
+            view=RebalanceView(self.portfolio_id),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="إنهاء المحفظة", style=discord.ButtonStyle.danger, emoji="🛑")
+    async def close_pf(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
+            if p:
+                close_portfolio(db, self.portfolio_id)
+                await interaction.response.send_message(f"✅ تم إنهاء محفظة **{p.name}**", ephemeral=True)
+            else:
+                await interaction.response.send_message("غير موجودة.", ephemeral=True)
+        finally:
+            db.close()
+
+
+class CoinsManageView(discord.ui.View):
+    def __init__(self, portfolio_id: int):
+        super().__init__(timeout=300)
+        self.portfolio_id = portfolio_id
+
+    @discord.ui.button(label="إضافة عملة", style=discord.ButtonStyle.success, emoji="🔍")
+    async def add_coin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AddCoinModal(self.portfolio_id))
+
+    @discord.ui.button(label="حذف عملة", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def remove_coin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
             if not p or not p.coins:
-                await query.edit_message_text("لا توجد عملات.", reply_markup=pf_coins_kb(pf_id))
+                await interaction.response.send_message("لا توجد عملات.", ephemeral=True)
                 return
-            buttons = [[InlineKeyboardButton(f"🗑️ {c.symbol}", callback_data=f"pfdel_{pf_id}_{c.symbol}")] for c in p.coins]
-            buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"pfcoins_{pf_id}")])
-            await query.edit_message_text("اختر العملة للحذف:", reply_markup=InlineKeyboardMarkup(buttons))
-            return
+            view = discord.ui.View(timeout=120)
+            for c in p.coins:
+                view.add_item(RemoveCoinButton(self.portfolio_id, c.symbol))
+            await interaction.response.send_message("اختر العملة للحذف:", view=view, ephemeral=True)
+        finally:
+            db.close()
 
-        if data.startswith("pfdel_"):
-            parts = data.split("_")
-            pf_id = int(parts[1])
-            symbol = parts[2]
-            remove_coin_from_portfolio(db, pf_id, symbol)
-            await query.edit_message_text(f"✅ تم حذف `{symbol}`", reply_markup=pf_coins_kb(pf_id), parse_mode="Markdown")
-            return
+    @discord.ui.button(label="رجوع", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "قائمة المحفظة:",
+            view=PortfolioMenuView(self.portfolio_id),
+            ephemeral=True
+        )
 
-        # ===== INCREASE INVESTMENT =====
-        if data.startswith("pfincrease_"):
-            pf_id = int(data.split("_")[1])
-            context.user_data['increase_pf'] = pf_id
-            await query.edit_message_text(
-                "أرسل المبلغ الإضافي بالـ USDT لزيادته على استثمار المحفظة:\nأو /cancel"
+
+class RemoveCoinButton(discord.ui.Button):
+    def __init__(self, portfolio_id: int, symbol: str):
+        super().__init__(label=f"حذف {symbol}", style=discord.ButtonStyle.danger)
+        self.portfolio_id = portfolio_id
+        self.symbol = symbol
+
+    async def callback(self, interaction: discord.Interaction):
+        db = SessionLocal()
+        try:
+            remove_coin_from_portfolio(db, self.portfolio_id, self.symbol)
+            await interaction.response.send_message(
+                f"✅ تم حذف `{self.symbol}`",
+                view=CoinsManageView(self.portfolio_id),
+                ephemeral=True
             )
-            return WAIT_INVESTMENT  # reuse, we'll check context
+        finally:
+            db.close()
 
-        # ===== REBALANCE =====
-        if data.startswith("pfrebalance_"):
-            pf_id = int(data.split("_")[1])
-            await query.edit_message_text("إعادة توازن المحفظة:", reply_markup=rebalance_pf_kb(pf_id))
+
+class AddCoinModal(discord.ui.Modal, title="إضافة عملة"):
+    def __init__(self, portfolio_id: int):
+        super().__init__()
+        self.portfolio_id = portfolio_id
+        self.symbol = discord.ui.TextInput(label="رمز العملة", placeholder="ONDO أو BTC", max_length=15)
+        self.add_item(self.symbol)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        sym = str(self.symbol.value).strip().upper()
+        if not is_coin_available(sym):
+            await interaction.followup.send(f"❌ `{sym}` غير متاحة على MEXC Spot/USDT.", ephemeral=True)
             return
+        db = SessionLocal()
+        try:
+            user = get_or_create_user(db, interaction.user.id)
+            ok, msg = add_coin_to_portfolio(db, self.portfolio_id, sym, max_coins=user.max_coins_per_portfolio)
+            await interaction.followup.send(msg, view=CoinsManageView(self.portfolio_id), ephemeral=True)
+        finally:
+            db.close()
 
-        if data.startswith("pfdry_") or data.startswith("pfreal_"):
-            dry = data.startswith("pfdry_")
-            pf_id = int(data.split("_")[1])
-            p = get_portfolio(db, pf_id, user_id)
-            if not p or not p.coins:
-                await query.edit_message_text("المحفظة فارغة من العملات.", reply_markup=rebalance_pf_kb(pf_id))
+
+class IncreaseInvestmentModal(discord.ui.Modal, title="زيادة الاستثمار"):
+    def __init__(self, portfolio_id: int):
+        super().__init__()
+        self.portfolio_id = portfolio_id
+        self.amount = discord.ui.TextInput(label="المبلغ الإضافي (USDT)", placeholder="20", max_length=20)
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            val = float(str(self.amount.value).strip())
+            if val <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("رقم غير صحيح.", ephemeral=True)
+            return
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
+            if not p:
+                await interaction.response.send_message("المحفظة غير موجودة.", ephemeral=True)
                 return
+            p.investment_usdt += val
+            db.commit()
+            await interaction.response.send_message(
+                f"✅ تم زيادة استثمار **{p.name}** بمبلغ {val}$\nالإجمالي: `{p.investment_usdt:.2f}$`",
+                view=PortfolioMenuView(self.portfolio_id),
+                ephemeral=True
+            )
+        finally:
+            db.close()
 
+
+class RebalanceView(discord.ui.View):
+    def __init__(self, portfolio_id: int):
+        super().__init__(timeout=180)
+        self.portfolio_id = portfolio_id
+
+    @discord.ui.button(label="معاينة (Dry Run)", style=discord.ButtonStyle.secondary, emoji="🔍")
+    async def dry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run(interaction, dry_run=True)
+
+    @discord.ui.button(label="تنفيذ فعلي", style=discord.ButtonStyle.danger, emoji="✅")
+    async def real(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run(interaction, dry_run=False)
+
+    async def _run(self, interaction: discord.Interaction, dry_run: bool):
+        await interaction.response.defer(ephemeral=True)
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
+            if not p or not p.coins:
+                await interaction.followup.send("المحفظة فارغة من العملات.", ephemeral=True)
+                return
+            user = get_or_create_user(db, interaction.user.id)
             symbols = [c.symbol for c in p.coins]
             result = get_rebalancer().execute_rebalance(
                 selected_coins=symbols,
                 allocation_method=p.allocation_method,
                 threshold=p.threshold,
                 min_trade_usdt=user.min_trade_usdt,
-                dry_run=dry
+                dry_run=dry_run
             )
-
-            lines = ["🔍 **معاينة**\n" if dry else "✅ **تم التنفيذ**\n"]
+            lines = ["🔍 **معاينة**\n" if dry_run else "✅ **تم التنفيذ**\n"]
             lines.append("**النسب المستهدفة:**")
-            for s, pct in result.get('targets', {}).items():
+            for s, pct in result.get("targets", {}).items():
                 lines.append(f"• `{s}` → {pct:.1f}%")
             lines.append("")
-
-            if result.get('message'):
-                lines.append(result['message'])
+            if result.get("message"):
+                lines.append(result["message"])
             else:
-                for o in result['executed']:
+                for o in result["executed"]:
                     lines.append(
                         f"• {o['side'].upper()} `{o['asset']}` "
                         f"{o['amount']:.6f} ≈ {o['usdt_value']:.2f}$ "
                         f"({o['current_pct']:.1f}%→{o['target_pct']:.1f}%)"
                     )
-                if result['errors']:
+                if result["errors"]:
                     lines.append("\n❌ أخطاء:")
-                    for e in result['errors']:
+                    for e in result["errors"]:
                         lines.append(f"• {e['error']}")
 
-            log_action(db, user_id, "rebalance_dry" if dry else "rebalance",
-                       str(result.get('executed', [])), success=not result['errors'], portfolio_id=pf_id)
-            if not dry:
+            log_action(
+                db, interaction.user.id,
+                "rebalance_dry" if dry_run else "rebalance",
+                str(result.get("executed", [])),
+                success=not result["errors"],
+                portfolio_id=self.portfolio_id
+            )
+            if not dry_run:
                 p.last_rebalance = datetime.utcnow()
                 db.commit()
 
-            await query.edit_message_text("\n".join(lines), reply_markup=rebalance_pf_kb(pf_id), parse_mode="Markdown")
-            return
+            await interaction.followup.send("\n".join(lines), view=RebalanceView(self.portfolio_id), ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"خطأ: `{e}`", ephemeral=True)
+        finally:
+            db.close()
 
-        # ===== START PORTFOLIO (buy with investment amount only) =====
-        if data.startswith("pfstart_"):
-            pf_id = int(data.split("_")[1])
-            p = get_portfolio(db, pf_id, user_id)
-            if not p:
-                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_kb())
-                return
-            symbols = [c.symbol for c in p.coins]
-            if not symbols:
-                await query.edit_message_text("المحفظة فارغة من العملات.", reply_markup=portfolio_menu_kb(pf_id))
-                return
 
-            investment = float(p.investment_usdt or 0)
-            if investment < 5:
-                await query.edit_message_text("مبلغ الاستثمار قليل جداً (أقل من 5$).", reply_markup=portfolio_menu_kb(pf_id))
-                return
+class GlobalSettingsView(discord.ui.View):
+    def __init__(self, user):
+        super().__init__(timeout=300)
+        self.user_id = user.discord_id
 
-            per_coin = investment / len(symbols)
-            if per_coin < 1:
-                await query.edit_message_text(
-                    f"المبلغ لكل عملة صغير جداً ({per_coin:.2f}$). زد الاستثمار أو قلل العملات.",
-                    reply_markup=portfolio_menu_kb(pf_id)
-                )
-                return
-
-            await query.edit_message_text(
-                f"⏳ جاري شراء عملات محفظة **{p.name}** بمبلغ `{investment:.2f}$` "
-                f"(≈ `{per_coin:.2f}$` لكل عملة)...",
-                parse_mode="Markdown"
-            )
-
-            client = get_mexc()
-            results = []
-            errors = []
-            for sym in symbols:
-                try:
-                    order = client.buy_with_usdt(f"{sym}/USDT", per_coin)
-                    results.append(f"✅ `{sym}` ← `{per_coin:.2f}$`")
-                except Exception as e:
-                    errors.append(f"❌ `{sym}`: {str(e)[:60]}")
-
-            lines = [f"▶️ **تشغيل محفظة {p.name}**\n", f"المبلغ المستخدم: `{investment:.2f} USDT`\n"]
-            lines.extend(results)
-            if errors:
-                lines.append("\n**أخطاء:**")
-                lines.extend(errors)
-
-            log_action(db, user_id, "portfolio_start", f"{p.name}: {investment}$ → {','.join(symbols)}",
-                       success=len(errors)==0, portfolio_id=pf_id)
-
-            await query.edit_message_text("\n".join(lines), reply_markup=portfolio_menu_kb(pf_id), parse_mode="Markdown")
-            return
-
-        # ===== CLOSE PORTFOLIO (sell coins of this portfolio) =====
-        if data.startswith("pfclose_"):
-            pf_id = int(data.split("_")[1])
-            p = get_portfolio(db, pf_id, user_id)
-            if not p:
-                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_kb())
-                return
-
-            symbols = [c.symbol for c in p.coins]
-            if not symbols:
-                close_portfolio(db, pf_id)
-                await query.edit_message_text(
-                    f"✅ تم إنهاء محفظة **{p.name}** (لا عملات للبيع)",
-                    reply_markup=main_menu_kb(), parse_mode="Markdown"
-                )
-                return
-
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ تأكيد البيع فقط", callback_data=f"pfcloseconfirm_{pf_id}")],
-                [InlineKeyboardButton("❌ إلغاء", callback_data=f"pf_{pf_id}")],
-            ])
-            await query.edit_message_text(
-                f"🛑 **بيع رصيد محفظة {p.name}**\n\n"
-                f"سيتم بيع رصيد العملات التالية إلى USDT (المحفظة تبقى):\n"
-                f"{', '.join(f'`{s}`' for s in symbols)}\n\n"
-                "⚠️ إذا كانت نفس العملة موجودة في محافظ أخرى، سيتم بيع الرصيد كله.",
-                reply_markup=kb, parse_mode="Markdown"
-            )
-            return
-
-        if data.startswith("pfcloseconfirm_"):
-            pf_id = int(data.split("_")[1])
-            p = get_portfolio(db, pf_id, user_id)
-            if not p:
-                await query.edit_message_text("غير موجودة.", reply_markup=main_menu_kb())
-                return
-
-            await query.edit_message_text("⏳ جاري بيع عملات المحفظة...")
-            client = get_mexc()
-            symbols = [c.symbol for c in p.coins]
-            results = []
-            errors = []
-            for sym in symbols:
-                try:
-                    order = client.sell_all_of(sym)
-                    if order:
-                        results.append(f"✅ تم بيع `{sym}`")
-                    else:
-                        results.append(f"⚪ `{sym}` لا يوجد رصيد")
-                except Exception as e:
-                    errors.append(f"❌ `{sym}`: {str(e)[:60]}")
-
-            log_action(db, user_id, "portfolio_sell", f"{p.name}: sold {','.join(symbols)}",
-                       success=len(errors)==0, portfolio_id=pf_id)
-
-            lines = [f"🛑 **تم بيع رصيد محفظة {p.name}**\n"]
-            lines.append("(المحفظة ما زالت موجودة ويمكن تشغيلها لاحقاً)\n")
-            lines.extend(results)
-            if errors:
-                lines.append("\n**أخطاء:**")
-                lines.extend(errors)
-            await query.edit_message_text("\n".join(lines), reply_markup=portfolio_menu_kb(pf_id), parse_mode="Markdown")
-            return
-
-        # ===== GLOBAL SETTINGS =====
-        if data == "global_settings":
-            await query.edit_message_text(
-                "**الإعدادات العامة** (تُطبق على المحافظ الجديدة):",
-                reply_markup=global_settings_kb(user),
-                parse_mode="Markdown"
-            )
-            return
-
-        if data == "gs_method":
+    @discord.ui.button(label="تبديل طريقة التوزيع", style=discord.ButtonStyle.primary)
+    async def toggle_method(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = SessionLocal()
+        try:
+            user = get_or_create_user(db, interaction.user.id)
             user.default_allocation_method = "marketcap" if user.default_allocation_method == "equal" else "equal"
             db.commit()
-            await query.edit_message_text("تم التحديث.", reply_markup=global_settings_kb(user))
-            return
+            method = "بالتساوي" if user.default_allocation_method == "equal" else "قيمة سوقية"
+            await interaction.response.send_message(f"✅ طريقة التوزيع: **{method}**", ephemeral=True)
+        finally:
+            db.close()
 
-        if data == "gs_mode":
+    @discord.ui.button(label="تبديل وضع الانحراف", style=discord.ButtonStyle.primary)
+    async def toggle_mode(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = SessionLocal()
+        try:
+            user = get_or_create_user(db, interaction.user.id)
             user.default_rebalance_mode = "time" if user.default_rebalance_mode == "threshold" else "threshold"
             db.commit()
-            await query.edit_message_text("تم التحديث.", reply_markup=global_settings_kb(user))
-            return
+            mode = "نسبي %" if user.default_rebalance_mode == "threshold" else "بالوقت"
+            await interaction.response.send_message(f"✅ وضع الانحراف: **{mode}**", ephemeral=True)
+        finally:
+            db.close()
 
-        if data == "gs_threshold":
-            await query.edit_message_text("أرسل نسبة Threshold الجديدة (مثلاً 2):\nأو /cancel")
-            return WAIT_THRESHOLD
-
-        if data == "gs_interval":
-            await query.edit_message_text("أرسل عدد الساعات (مثلاً 24):\nأو /cancel")
-            return WAIT_INTERVAL
-
-        if data == "gs_mintrade":
-            await query.edit_message_text("أرسل الحد الأدنى للصفقة بالـ USDT:\nأو /cancel")
-            return WAIT_MIN_TRADE
-
-        if data == "gs_maxcoins":
-            await query.edit_message_text("أرسل أقصى عدد عملات لكل محفظة:\nأو /cancel")
-            return WAIT_MAX_COINS
-
-        # ===== LOGS =====
-        if data == "logs":
-            from database import RebalanceLog
-            logs = db.query(RebalanceLog).filter(RebalanceLog.telegram_id == user_id)\
-                .order_by(RebalanceLog.created_at.desc()).limit(15).all()
-            if not logs:
-                text = "لا يوجد سجل."
-            else:
-                lines = ["**آخر العمليات:**\n"]
-                for log in logs:
-                    st = "✅" if log.success else "❌"
-                    lines.append(f"{st} `{log.created_at.strftime('%m-%d %H:%M')}` {log.action}")
-                text = "\n".join(lines)
-            await query.edit_message_text(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
-            return
-
-    finally:
-        db.close()
+    @discord.ui.button(label="تعديل Threshold", style=discord.ButtonStyle.secondary)
+    async def set_threshold(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ThresholdModal())
 
 
-# ==================== CONVERSATIONS ====================
+class ThresholdModal(discord.ui.Modal, title="تعديل Threshold"):
+    value = discord.ui.TextInput(label="نسبة الانحراف %", placeholder="2", max_length=10)
 
-async def receive_portfolio_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.upper() == "/CANCEL":
-        await update.message.reply_text("تم الإلغاء.", reply_markup=main_menu_kb())
-        return ConversationHandler.END
-
-    context.user_data['pf_name'] = text[:80]
-    await update.message.reply_text(
-        f"اسم المحفظة: **{text}**\n\n"
-        "الآن أرسل مبلغ الاستثمار بالـ USDT (مثلاً 50 أو 100):\n"
-        "ملاحظة: الحد الأدنى = 5$ × عدد العملات\nأو /cancel",
-        parse_mode="Markdown"
-    )
-    return WAIT_INVESTMENT
-
-
-async def receive_investment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.upper() == "/CANCEL":
-        await update.message.reply_text("تم الإلغاء.", reply_markup=main_menu_kb())
-        return ConversationHandler.END
-
-    # Check if this is increase
-    if context.user_data.get('increase_pf'):
+    async def on_submit(self, interaction: discord.Interaction):
         try:
-            amount = float(text)
-            if amount <= 0:
+            val = float(str(self.value.value).strip())
+            if not (0 < val <= 50):
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("أدخل رقم موجب:")
-            return WAIT_INVESTMENT
-
-        pf_id = context.user_data['increase_pf']
+            await interaction.response.send_message("أدخل رقم بين 0 و 50.", ephemeral=True)
+            return
         db = SessionLocal()
         try:
-            p = get_portfolio(db, pf_id, update.effective_user.id)
-            if p:
-                p.investment_usdt += amount
-                db.commit()
-                await update.message.reply_text(
-                    f"✅ تم زيادة استثمار **{p.name}** بمبلغ {amount}$\n"
-                    f"الإجمالي الجديد: `{p.investment_usdt:.2f}$`",
-                    reply_markup=portfolio_menu_kb(pf_id),
-                    parse_mode="Markdown"
-                )
+            user = get_or_create_user(db, interaction.user.id)
+            user.default_threshold = val
+            db.commit()
+            await interaction.response.send_message(f"✅ Threshold = {val}%", ephemeral=True)
         finally:
             db.close()
-        context.user_data.pop('increase_pf', None)
-        return ConversationHandler.END
 
-    # Creating new portfolio
+
+# ==================== SLASH COMMANDS ====================
+
+@bot.event
+async def on_ready():
+    logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     try:
-        amount = float(text)
-        if amount < 5:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("أدخل مبلغ ≥ 5 USDT:")
-        return WAIT_INVESTMENT
+        synced = await bot.tree.sync()
+        logger.info(f"Synced {len(synced)} slash commands")
+    except Exception as e:
+        logger.error(f"Sync error: {e}")
 
-    context.user_data['pf_investment'] = amount
-    context.user_data['coins'] = []
-    await update.message.reply_text(
-        f"الاستثمار: `{amount}$`\n\n"
-        "الآن أضف العملات.\n"
-        "يمكنك إرسال عدة عملات مفصولة بفاصلة (حد أقصى 10):\n"
-        "مثال: `BTC,ETH,ONDO,SOL`\n\n"
-        "أو أرسل عملة واحدة ثم اكتب **تم** عندما تنتهي.\n"
-        "أو /cancel",
-        parse_mode="Markdown"
+
+@bot.tree.command(name="start", description="القائمة الرئيسية لبوت محافظ MEXC")
+async def start_cmd(interaction: discord.Interaction):
+    if not is_authorized(interaction.user.id):
+        await interaction.response.send_message("غير مصرح لك باستخدام هذا البوت.", ephemeral=True)
+        return
+    db = SessionLocal()
+    try:
+        get_or_create_user(db, interaction.user.id)
+    finally:
+        db.close()
+
+    text = (
+        f"مرحباً **{interaction.user.display_name}** 👋\n\n"
+        "بوت **محافظ MEXC المتعددة**\n\n"
+        "• أنشئ محافظ منفصلة\n"
+        "• كل محفظة لها عملاتها وإعداداتها واستثمارها\n"
+        "• تحكم كامل (إضافة/حذف عملات، زيادة استثمار، إعادة توازن، إنهاء)\n"
+        "• الحد الأدنى 5$ لكل عملة\n"
+        "• البحث لحظي عن توفر العملة على MEXC"
     )
-    return WAIT_SEARCH_COIN
+    await interaction.response.send_message(text, view=MainMenuView(), ephemeral=True)
 
 
-async def receive_search_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().upper()
-    if text == "/CANCEL":
-        await update.message.reply_text("تم الإلغاء.", reply_markup=main_menu_kb())
-        return ConversationHandler.END
-
-    if text in ("تم", "DONE", "انتهيت"):
-        coins = context.user_data.get('coins', [])
-        if not coins:
-            await update.message.reply_text("لازم تضيف عملة واحدة على الأقل. أرسل رمز عملة:")
-            return WAIT_SEARCH_COIN
-
-        name = context.user_data['pf_name']
-        investment = context.user_data['pf_investment']
-        user_id = update.effective_user.id
-
-        db = SessionLocal()
-        try:
-            user = get_or_create_user(db, user_id)
-            min_needed = user.min_usdt_per_coin * len(coins)
-            if investment < min_needed:
-                await update.message.reply_text(
-                    f"⚠️ المبلغ قليل. الحد الأدنى لـ {len(coins)} عملات = {min_needed}$\n"
-                    "أرسل مبلغ أكبر أو احذف عملات."
-                )
-                return WAIT_SEARCH_COIN
-
-            p = create_portfolio(
-                db, user_id, name, investment, coins,
-                allocation_method=user.default_allocation_method,
-                rebalance_mode=user.default_rebalance_mode,
-                threshold=user.default_threshold,
-                interval=user.default_interval_hours
-            )
-            await update.message.reply_text(
-                f"✅ تم إنشاء محفظة **{p.name}**\n"
-                f"الاستثمار: `{p.investment_usdt}$`\n"
-                f"العملات: {', '.join(coins)}",
-                reply_markup=portfolio_menu_kb(p.id),
-                parse_mode="Markdown"
-            )
-        finally:
-            db.close()
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    # Support multiple coins separated by comma
-    raw_symbols = [s.strip() for s in text.replace("،", ",").split(",") if s.strip()]
-    if not raw_symbols:
-        await update.message.reply_text("أرسل رمز عملة أو عدة عملات مفصولة بفاصلة.")
-        return WAIT_SEARCH_COIN
-
-    coins = context.user_data.get('coins', [])
+@bot.tree.command(name="portfolios", description="عرض محافظك النشطة")
+async def portfolios_cmd(interaction: discord.Interaction):
+    if not is_authorized(interaction.user.id):
+        await interaction.response.send_message("غير مصرح.", ephemeral=True)
+        return
     db = SessionLocal()
     try:
-        user = get_or_create_user(db, update.effective_user.id)
-        max_c = min(user.max_coins_per_portfolio, 10)
+        pfs = get_portfolios(db, interaction.user.id, status="active")
+        if not pfs:
+            await interaction.response.send_message("لا توجد محافظ نشطة.", view=CreatePortfolioView(), ephemeral=True)
+            return
+        await interaction.response.send_message("محافظك النشطة:", view=PortfoliosListView(pfs), ephemeral=True)
     finally:
         db.close()
 
-    added = []
-    skipped = []
-    for sym in raw_symbols:
-        if len(coins) + len(added) >= max_c:
-            skipped.append(f"{sym} (حد أقصى {max_c})")
-            continue
-        if sym in coins or sym in added:
-            skipped.append(f"{sym} (موجودة)")
-            continue
-        if not is_coin_available(sym):
-            skipped.append(f"{sym} (غير متاحة)")
-            continue
-        added.append(sym)
 
-    coins.extend(added)
-    context.user_data['coins'] = coins
-
-    msg_parts = []
-    if added:
-        msg_parts.append(f"✅ تم إضافة: {', '.join(added)}")
-    if skipped:
-        msg_parts.append(f"⚠️ تم تخطي: {', '.join(skipped)}")
-    msg_parts.append(f"\nالعملات الحالية ({len(coins)}/{max_c}): {', '.join(coins) if coins else 'لا يوجد'}")
-    msg_parts.append("\nأرسل عملات أخرى أو اكتب **تم**")
-    await update.message.reply_text("\n".join(msg_parts), parse_mode="Markdown")
-    return WAIT_SEARCH_COIN
-
-
-async def receive_add_coin_to_pf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().upper()
-    if text == "/CANCEL":
-        await update.message.reply_text("تم الإلغاء.", reply_markup=main_menu_kb())
-        return ConversationHandler.END
-
-    pf_id = context.user_data.get('add_to_pf')
-    if not pf_id:
-        await update.message.reply_text("خطأ.", reply_markup=main_menu_kb())
-        return ConversationHandler.END
-
-    await update.message.reply_text(f"⏳ جاري التحقق من `{text}`...", parse_mode="Markdown")
-    if not is_coin_available(text):
-        await update.message.reply_text(f"❌ `{text}` غير متاحة على MEXC.", parse_mode="Markdown")
-        return WAIT_ADD_COIN_TO_PF
-
-    db = SessionLocal()
+@bot.tree.command(name="balance", description="رصيد الحساب الكامل على MEXC")
+async def balance_cmd(interaction: discord.Interaction):
+    if not is_authorized(interaction.user.id):
+        await interaction.response.send_message("غير مصرح.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
     try:
-        user = get_or_create_user(db, update.effective_user.id)
-        ok, msg = add_coin_to_portfolio(db, pf_id, text, max_coins=user.max_coins_per_portfolio)
-        await update.message.reply_text(msg, reply_markup=pf_coins_kb(pf_id), parse_mode="Markdown")
-    finally:
-        db.close()
-    context.user_data.pop('add_to_pf', None)
-    return ConversationHandler.END
+        bal = get_mexc().get_portfolio_value()
+        await interaction.followup.send(format_full_balance(bal), ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"خطأ: `{e}`", ephemeral=True)
 
 
-async def receive_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.upper() == "/CANCEL":
-        await update.message.reply_text("تم الإلغاء.", reply_markup=main_menu_kb())
-        return ConversationHandler.END
-    try:
-        val = float(text)
-        if not (0 < val <= 50):
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("أدخل رقم بين 0 و 50:")
-        return WAIT_THRESHOLD
-
-    db = SessionLocal()
-    try:
-        user = get_or_create_user(db, update.effective_user.id)
-        user.default_threshold = val
-        db.commit()
-        await update.message.reply_text(f"✅ Threshold = {val}%", reply_markup=global_settings_kb(user))
-    finally:
-        db.close()
-    return ConversationHandler.END
-
-
-async def receive_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.upper() == "/CANCEL":
-        await update.message.reply_text("تم الإلغاء.", reply_markup=main_menu_kb())
-        return ConversationHandler.END
-    try:
-        val = int(text)
-        if not (1 <= val <= 168):
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("أدخل رقم بين 1 و 168:")
-        return WAIT_INTERVAL
-
-    db = SessionLocal()
-    try:
-        user = get_or_create_user(db, update.effective_user.id)
-        user.default_interval_hours = val
-        db.commit()
-        await update.message.reply_text(f"✅ الفترة = {val} ساعة", reply_markup=global_settings_kb(user))
-    finally:
-        db.close()
-    return ConversationHandler.END
-
-
-async def receive_min_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.upper() == "/CANCEL":
-        await update.message.reply_text("تم الإلغاء.", reply_markup=main_menu_kb())
-        return ConversationHandler.END
-    try:
-        val = float(text)
-        if val < 1:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("أدخل رقم ≥ 1:")
-        return WAIT_MIN_TRADE
-
-    db = SessionLocal()
-    try:
-        user = get_or_create_user(db, update.effective_user.id)
-        user.min_trade_usdt = val
-        db.commit()
-        await update.message.reply_text(f"✅ الحد الأدنى = {val}$", reply_markup=global_settings_kb(user))
-    finally:
-        db.close()
-    return ConversationHandler.END
-
-
-async def receive_max_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.upper() == "/CANCEL":
-        await update.message.reply_text("تم الإلغاء.", reply_markup=main_menu_kb())
-        return ConversationHandler.END
-    try:
-        val = int(text)
-        if not (1 <= val <= 30):
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("أدخل رقم بين 1 و 30:")
-        return WAIT_MAX_COINS
-
-    db = SessionLocal()
-    try:
-        user = get_or_create_user(db, update.effective_user.id)
-        user.max_coins_per_portfolio = val
-        db.commit()
-        await update.message.reply_text(f"✅ أقصى عملات = {val}", reply_markup=global_settings_kb(user))
-    finally:
-        db.close()
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("تم الإلغاء.", reply_markup=main_menu_kb())
-    return ConversationHandler.END
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Exception:", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text("حدث خطأ. حاول مرة أخرى.")
+@bot.tree.command(name="create", description="إنشاء محفظة جديدة")
+async def create_cmd(interaction: discord.Interaction):
+    if not is_authorized(interaction.user.id):
+        await interaction.response.send_message("غير مصرح.", ephemeral=True)
+        return
+    await interaction.response.send_modal(CreatePortfolioModal())
 
 
 def main():
-    if not all([config.TELEGRAM_BOT_TOKEN, config.MEXC_API_KEY, config.MEXC_API_SECRET, config.DATABASE_URL]):
-        raise ValueError("Missing required environment variables")
+    if not config.DISCORD_BOT_TOKEN:
+        raise ValueError("DISCORD_BOT_TOKEN is required")
+    if not config.MEXC_API_KEY or not config.MEXC_API_SECRET:
+        raise ValueError("MEXC_API_KEY and MEXC_API_SECRET are required")
+    if not config.DATABASE_URL:
+        raise ValueError("DATABASE_URL is required")
 
     init_db()
-    logger.info("DB ready")
-
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
-
-    create_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^create_portfolio$")],
-        states={
-            WAIT_PORTFOLIO_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_portfolio_name)],
-            WAIT_INVESTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_investment)],
-            WAIT_SEARCH_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_search_coin)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    add_coin_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^pfaddcoin_")],
-        states={
-            WAIT_ADD_COIN_TO_PF: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_add_coin_to_pf)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    increase_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^pfincrease_")],
-        states={
-            WAIT_INVESTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_investment)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    thresh_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^gs_threshold$")],
-        states={WAIT_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_threshold)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    # Fix: WAIT_THRESHOLD etc already defined
-    thresh_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^gs_threshold$")],
-        states={WAIT_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_threshold)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-    interval_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^gs_interval$")],
-        states={WAIT_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_interval)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-    mintrade_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^gs_mintrade$")],
-        states={WAIT_MIN_TRADE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_min_trade)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-    maxcoins_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^gs_maxcoins$")],
-        states={WAIT_MAX_COINS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_max_coins)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(create_conv)
-    app.add_handler(add_coin_conv)
-    app.add_handler(increase_conv)
-    app.add_handler(thresh_conv)
-    app.add_handler(interval_conv)
-    app.add_handler(mintrade_conv)
-    app.add_handler(maxcoins_conv)
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_error_handler(error_handler)
-
-    logger.info("Bot starting (multi-portfolio)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Database initialized")
+    bot.run(config.DISCORD_BOT_TOKEN)
 
 
 if __name__ == "__main__":

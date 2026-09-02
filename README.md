@@ -1,52 +1,54 @@
-# MEXC Portfolio Rebalancer Bot (Telegram)
+# MEXC Multi-Portfolio Rebalancer (Discord Bot)
 
-بوت تيليجرام كامل للتحكم في إعادة توازن محفظة Spot على منصة MEXC.
+بوت ديسكورد لإدارة محافظ متعددة على منصة MEXC Spot مع إعادة توازن.
 
-## التدفق الجديد (حسب طلبك)
+## المميزات
 
-1. **اختيار العملات**  
-   - تبحث عن العملة لحظياً  
-   - البوت يتحقق فوراً هل متاحة على MEXC (Spot / USDT) أم لا  
-   - لا تدخل نسبة أمام كل عملة
+- محافظ متعددة منفصلة
+- إنشاء محفظة (اسم + استثمار + عملات)
+- بحث لحظي عن توفر العملة على MEXC
+- إضافة / حذف عملات
+- زيادة الاستثمار
+- معاينة + تنفيذ إعادة توازن
+- إنهاء المحفظة
+- إعدادات عامة (تساوي / قيمة سوقية، Threshold، ...)
+- الحد الأدنى 5$ لكل عملة
 
-2. **الحد الأقصى للعملات**  
-   - تحدده من الإعدادات (مثلاً 10)
-
-3. **طريقة التوزيع**  
-   - بالتساوي (Equal)  
-   - أو حسب القيمة السوقية الحالية في المحفظة
-
-4. **وضع الانحراف**  
-   - نسبي % (Threshold)  
-   - أو بالوقت (كل X ساعة)
-
-5. **إعادة التوازن**  
-   - معاينة (Dry Run)  
-   - ثم تنفيذ فعلي
-
-## المتغيرات المطلوبة في Railway فقط
+## المتغيرات في Railway فقط
 
 | المتغير | الوصف |
 |---------|--------|
-| `TELEGRAM_BOT_TOKEN` | توكن بوت تيليجرام |
+| `DISCORD_BOT_TOKEN` | توكن بوت الديسكورد |
 | `MEXC_API_KEY` | مفتاح API من MEXC |
 | `MEXC_API_SECRET` | السر |
 | `DATABASE_URL` | رابط PostgreSQL |
-| `ADMIN_TELEGRAM_ID` | (اختياري) رقمك في تيليجرام |
+| `ADMIN_DISCORD_ID` | (اختياري) رقم الديسكورد الخاص بك |
 
-كل باقي الإعدادات تُدار من داخل البوت.
+## إعداد بوت الديسكورد
 
-## خطوات النشر
+1. ادخل https://discord.com/developers/applications
+2. New Application → Bot → Reset Token → انسخ التوكن
+3. فعّل **Message Content Intent** (في Bot settings)
+4. OAuth2 → URL Generator → scopes: `bot` + `applications.commands`
+5. Permissions: Send Messages, Use Slash Commands, Embed Links
+6. افتح الرابط وأضف البوت لسيرفرك
 
-1. ارفع الملفات على الريبو: https://github.com/fm1275712-byte/mexc
-2. على Railway:
-   - Deploy from GitHub
-   - أضف PostgreSQL
-   - أضف المتغيرات أعلاه
-   - Start Command: `python bot.py`
+## أوامر السلاش
 
-## ملاحظات
+- `/start` — القائمة الرئيسية بالأزرار
+- `/portfolios` — محافظك
+- `/balance` — رصيد الحساب الكامل
+- `/create` — إنشاء محفظة جديدة (Modal)
 
-- البحث عن العملات لحظي عبر ccxt + MEXC
-- النسب تُحسب تلقائياً حسب طريقة التوزيع المختارة
-- لا تحتاج تدخل يدوي في النسب لكل عملة
+## النشر على Railway
+
+1. ارفع الكود على GitHub
+2. Deploy from GitHub
+3. أضف PostgreSQL
+4. Variables:
+   - `DISCORD_BOT_TOKEN`
+   - `MEXC_API_KEY`
+   - `MEXC_API_SECRET`
+   - `DATABASE_URL` = `${{Postgres.DATABASE_URL}}`
+   - `ADMIN_DISCORD_ID` (مستحسن)
+5. Start Command: `python bot.py`
