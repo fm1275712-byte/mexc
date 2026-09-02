@@ -90,12 +90,13 @@ def portfolios_list_kb(portfolios):
 
 def portfolio_menu_kb(pf_id):
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ تشغيل (شراء)", callback_data=f"pfstart_{pf_id}")],
         [InlineKeyboardButton("📋 تفاصيل المحفظة", callback_data=f"pfdetail_{pf_id}")],
         [InlineKeyboardButton("🪙 العملات", callback_data=f"pfcoins_{pf_id}")],
         [InlineKeyboardButton("💰 زيادة الاستثمار", callback_data=f"pfincrease_{pf_id}")],
         [InlineKeyboardButton("⚖️ إعادة التوازن", callback_data=f"pfrebalance_{pf_id}")],
         [InlineKeyboardButton("⚙️ إعدادات المحفظة", callback_data=f"pfsettings_{pf_id}")],
-        [InlineKeyboardButton("🛑 إنهاء المحفظة", callback_data=f"pfclose_{pf_id}")],
+        [InlineKeyboardButton("🛑 إنهاء وبيع المحفظة", callback_data=f"pfclose_{pf_id}")],
         [InlineKeyboardButton("🔙 محافظي", callback_data="my_portfolios")],
     ])
 
@@ -314,7 +315,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 and not data.startswith("pfsettings_") and not data.startswith("pfclose_") \
                 and not data.startswith("pfaddcoin_") and not data.startswith("pfremovecoin_") \
                 and not data.startswith("pfdry_") and not data.startswith("pfreal_") \
-                and not data.startswith("pfdel_"):
+                and not data.startswith("pfdel_") and not data.startswith("pfstart_"):
             pf_id = int(data.split("_")[1])
             p = get_portfolio(db, pf_id, user_id)
             if not p:
@@ -439,17 +440,121 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("\n".join(lines), reply_markup=rebalance_pf_kb(pf_id), parse_mode="Markdown")
             return
 
-        # ===== CLOSE PORTFOLIO =====
+        # ===== START PORTFOLIO (buy with investment amount only) =====
+        if data.startswith("pfstart_"):
+            pf_id = int(data.split("_")[1])
+            p = get_portfolio(db, pf_id, user_id)
+            if not p:
+                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_kb())
+                return
+            symbols = [c.symbol for c in p.coins]
+            if not symbols:
+                await query.edit_message_text("المحفظة فارغة من العملات.", reply_markup=portfolio_menu_kb(pf_id))
+                return
+
+            investment = float(p.investment_usdt or 0)
+            if investment < 5:
+                await query.edit_message_text("مبلغ الاستثمار قليل جداً (أقل من 5$).", reply_markup=portfolio_menu_kb(pf_id))
+                return
+
+            per_coin = investment / len(symbols)
+            if per_coin < 1:
+                await query.edit_message_text(
+                    f"المبلغ لكل عملة صغير جداً ({per_coin:.2f}$). زد الاستثمار أو قلل العملات.",
+                    reply_markup=portfolio_menu_kb(pf_id)
+                )
+                return
+
+            await query.edit_message_text(
+                f"⏳ جاري شراء عملات محفظة **{p.name}** بمبلغ `{investment:.2f}$` "
+                f"(≈ `{per_coin:.2f}$` لكل عملة)...",
+                parse_mode="Markdown"
+            )
+
+            client = get_mexc()
+            results = []
+            errors = []
+            for sym in symbols:
+                try:
+                    order = client.buy_with_usdt(f"{sym}/USDT", per_coin)
+                    results.append(f"✅ `{sym}` ← `{per_coin:.2f}$`")
+                except Exception as e:
+                    errors.append(f"❌ `{sym}`: {str(e)[:60]}")
+
+            lines = [f"▶️ **تشغيل محفظة {p.name}**\n", f"المبلغ المستخدم: `{investment:.2f} USDT`\n"]
+            lines.extend(results)
+            if errors:
+                lines.append("\n**أخطاء:**")
+                lines.extend(errors)
+
+            log_action(db, user_id, "portfolio_start", f"{p.name}: {investment}$ → {','.join(symbols)}",
+                       success=len(errors)==0, portfolio_id=pf_id)
+
+            await query.edit_message_text("\n".join(lines), reply_markup=portfolio_menu_kb(pf_id), parse_mode="Markdown")
+            return
+
+        # ===== CLOSE PORTFOLIO (sell coins of this portfolio) =====
         if data.startswith("pfclose_"):
             pf_id = int(data.split("_")[1])
             p = get_portfolio(db, pf_id, user_id)
-            if p:
+            if not p:
+                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_kb())
+                return
+
+            symbols = [c.symbol for c in p.coins]
+            if not symbols:
                 close_portfolio(db, pf_id)
                 await query.edit_message_text(
-                    f"✅ تم إنهاء محفظة **{p.name}**",
-                    reply_markup=main_menu_kb(),
-                    parse_mode="Markdown"
+                    f"✅ تم إنهاء محفظة **{p.name}** (لا عملات للبيع)",
+                    reply_markup=main_menu_kb(), parse_mode="Markdown"
                 )
+                return
+
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ تأكيد البيع والإنهاء", callback_data=f"pfcloseconfirm_{pf_id}")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data=f"pf_{pf_id}")],
+            ])
+            await query.edit_message_text(
+                f"🛑 **إنهاء محفظة {p.name}**\n\n"
+                f"سيتم بيع العملات التالية إلى USDT:\n"
+                f"{', '.join(f'`{s}`' for s in symbols)}\n\n"
+                "⚠️ إذا كانت نفس العملة موجودة في محافظ أخرى، سيتم بيع الرصيد كله.",
+                reply_markup=kb, parse_mode="Markdown"
+            )
+            return
+
+        if data.startswith("pfcloseconfirm_"):
+            pf_id = int(data.split("_")[1])
+            p = get_portfolio(db, pf_id, user_id)
+            if not p:
+                await query.edit_message_text("غير موجودة.", reply_markup=main_menu_kb())
+                return
+
+            await query.edit_message_text("⏳ جاري بيع عملات المحفظة...")
+            client = get_mexc()
+            symbols = [c.symbol for c in p.coins]
+            results = []
+            errors = []
+            for sym in symbols:
+                try:
+                    order = client.sell_all_of(sym)
+                    if order:
+                        results.append(f"✅ تم بيع `{sym}`")
+                    else:
+                        results.append(f"⚪ `{sym}` لا يوجد رصيد")
+                except Exception as e:
+                    errors.append(f"❌ `{sym}`: {str(e)[:60]}")
+
+            close_portfolio(db, pf_id)
+            log_action(db, user_id, "portfolio_close", f"{p.name}: sold {','.join(symbols)}",
+                       success=len(errors)==0, portfolio_id=pf_id)
+
+            lines = [f"🛑 **تم إنهاء محفظة {p.name}**\n"]
+            lines.extend(results)
+            if errors:
+                lines.append("\n**أخطاء:**")
+                lines.extend(errors)
+            await query.edit_message_text("\n".join(lines), reply_markup=main_menu_kb(), parse_mode="Markdown")
             return
 
         # ===== GLOBAL SETTINGS =====

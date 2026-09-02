@@ -102,6 +102,32 @@ class MexcClient:
         except Exception as e:
             raise Exception(f"Order failed: {str(e)}")
 
+
+    def buy_with_usdt(self, symbol: str, usdt_amount: float) -> dict:
+        """Market buy using approximate USDT amount. symbol like BTC/USDT"""
+        price = self.get_ticker_price(symbol)
+        if price <= 0:
+            raise Exception("Invalid price")
+        amount = (usdt_amount * 0.997) / price  # buffer for fees
+        if amount <= 0:
+            raise Exception("Amount too small")
+        order = self.exchange.create_order(
+            symbol=symbol,
+            type='market',
+            side='buy',
+            amount=amount
+        )
+        return order
+
+    def sell_all_of(self, asset: str) -> dict:
+        """Sell entire free balance of an asset to USDT"""
+        bal = self.get_balance()
+        amount = float(bal.get(asset, 0.0) or 0)
+        if amount <= 0:
+            return None
+        amount = amount * 0.999
+        return self.create_market_order(f"{asset}/{self.quote}", "sell", amount)
+
     def get_markets(self) -> List[str]:
         """Return list of available base assets that have /USDT pair"""
         markets = self.exchange.load_markets()
