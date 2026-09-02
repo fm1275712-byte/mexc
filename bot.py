@@ -70,6 +70,7 @@ def main_menu_kb():
         [InlineKeyboardButton("📁 محافظي", callback_data="my_portfolios")],
         [InlineKeyboardButton("➕ إنشاء محفظة جديدة", callback_data="create_portfolio")],
         [InlineKeyboardButton("📊 رصيد الحساب الكامل", callback_data="full_balance")],
+        [InlineKeyboardButton("🚨 بيع الكل (طوارئ)", callback_data="emergency_sell")],
         [InlineKeyboardButton("⚙️ الإعدادات العامة", callback_data="global_settings")],
         [InlineKeyboardButton("📜 السجل", callback_data="logs")],
     ])
@@ -216,6 +217,69 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
             except Exception as e:
                 await query.edit_message_text(f"خطأ: `{e}`", reply_markup=main_menu_kb(), parse_mode="Markdown")
+            return
+
+        # ===== EMERGENCY SELL ALL =====
+        if data == "emergency_sell":
+            try:
+                bal = get_mexc().get_portfolio_value()
+                assets = {k: v for k, v in bal.get('assets', {}).items() if k != 'USDT' and v.get('usdt_value', 0) > 0.5}
+                if not assets:
+                    await query.edit_message_text("لا توجد أصول للبيع (كل شيء USDT).", reply_markup=main_menu_kb())
+                    return
+                lines = ["🚨 **بيع الكل (طوارئ)**\n", "سيتم بيع الأصول التالية إلى USDT:\n"]
+                total = 0
+                for a, d in sorted(assets.items(), key=lambda x: -x[1]['usdt_value']):
+                    lines.append(f"• `{a}`: {d['amount']:.6f} ≈ `{d['usdt_value']:.2f}$`")
+                    total += d['usdt_value']
+                lines.append(f"\n**الإجمالي التقريبي:** `{total:.2f} USDT`")
+                lines.append("\n⚠️ هذا الإجراء لا يمكن التراجع عنه.")
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ تأكيد بيع الكل", callback_data="emergency_sell_confirm")],
+                    [InlineKeyboardButton("❌ إلغاء", callback_data="main_menu")],
+                ])
+                await query.edit_message_text("\n".join(lines), reply_markup=kb, parse_mode="Markdown")
+            except Exception as e:
+                await query.edit_message_text(f"خطأ: `{e}`", reply_markup=main_menu_kb(), parse_mode="Markdown")
+            return
+
+        if data == "emergency_sell_confirm":
+            await query.edit_message_text("⏳ جاري بيع جميع الأصول إلى USDT...")
+            try:
+                client = get_mexc()
+                bal = client.get_portfolio_value()
+                results = []
+                errors = []
+                for asset, data in bal.get('assets', {}).items():
+                    if asset == 'USDT' or data.get('amount', 0) <= 0:
+                        continue
+                    amount = data['amount'] * 0.999  # leave tiny dust
+                    if data.get('usdt_value', 0) < 0.5:
+                        continue
+                    try:
+                        order = client.create_market_order(f"{asset}/USDT", "sell", amount)
+                        results.append(f"✅ `{asset}`: {amount:.6f}")
+                    except Exception as e:
+                        errors.append(f"❌ `{asset}`: {str(e)[:80]}")
+                lines = ["🚨 **نتيجة بيع الكل:**\n"]
+                lines.extend(results if results else ["لم يتم بيع أي شيء."])
+                if errors:
+                    lines.append("\n**أخطاء:**")
+                    lines.extend(errors)
+                # refresh balance
+                try:
+                    new_bal = client.get_portfolio_value()
+                    lines.append(f"\n💰 الرصيد بعد البيع: `{new_bal['total_usdt']:.2f} USDT`")
+                except Exception:
+                    pass
+                db = SessionLocal()
+                try:
+                    log_action(db, user_id, "emergency_sell", f"sold {len(results)} assets", success=len(errors)==0)
+                finally:
+                    db.close()
+                await query.edit_message_text("\n".join(lines), reply_markup=main_menu_kb(), parse_mode="Markdown")
+            except Exception as e:
+                await query.edit_message_text(f"فشل البيع: `{e}`", reply_markup=main_menu_kb(), parse_mode="Markdown")
             return
 
         # ===== MY PORTFOLIOS =====
@@ -510,9 +574,11 @@ async def receive_investment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data['coins'] = []
     await update.message.reply_text(
         f"الاستثمار: `{amount}$`\n\n"
-        "الآن أضف العملات.\nأرسل رمز العملة (مثل BTC أو ONDO):\n"
-        "بعد كل عملة سأتحقق لحظياً هل متاحة على MEXC.\n"
-        "عندما تنتهي اكتب **تم**\nأو /cancel",
+        "الآن أضف العملات.\n"
+        "يمكنك إرسال عدة عملات مفصولة بفاصلة (حد أقصى 10):\n"
+        "مثال: `BTC,ETH,ONDO,SOL`\n\n"
+        "أو أرسل عملة واحدة ثم اكتب **تم** عندما تنتهي.\n"
+        "أو /cancel",
         parse_mode="Markdown"
     )
     return WAIT_SEARCH_COIN
@@ -564,35 +630,45 @@ async def receive_search_coin(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data.clear()
         return ConversationHandler.END
 
-    # Add coin
-    await update.message.reply_text(f"⏳ جاري التحقق من `{text}`...", parse_mode="Markdown")
-    if not is_coin_available(text):
-        await update.message.reply_text(f"❌ `{text}` غير متاحة على MEXC Spot/USDT.\nجرب غيرها أو اكتب تم", parse_mode="Markdown")
+    # Support multiple coins separated by comma
+    raw_symbols = [s.strip() for s in text.replace("،", ",").split(",") if s.strip()]
+    if not raw_symbols:
+        await update.message.reply_text("أرسل رمز عملة أو عدة عملات مفصولة بفاصلة.")
         return WAIT_SEARCH_COIN
 
     coins = context.user_data.get('coins', [])
     db = SessionLocal()
     try:
         user = get_or_create_user(db, update.effective_user.id)
-        max_c = user.max_coins_per_portfolio
+        max_c = min(user.max_coins_per_portfolio, 10)
     finally:
         db.close()
 
-    if text in coins:
-        await update.message.reply_text(f"`{text}` موجودة بالفعل.", parse_mode="Markdown")
-        return WAIT_SEARCH_COIN
-    if len(coins) >= max_c:
-        await update.message.reply_text(f"وصلت للحد الأقصى ({max_c}). اكتب **تم**")
-        return WAIT_SEARCH_COIN
+    added = []
+    skipped = []
+    for sym in raw_symbols:
+        if len(coins) + len(added) >= max_c:
+            skipped.append(f"{sym} (حد أقصى {max_c})")
+            continue
+        if sym in coins or sym in added:
+            skipped.append(f"{sym} (موجودة)")
+            continue
+        if not is_coin_available(sym):
+            skipped.append(f"{sym} (غير متاحة)")
+            continue
+        added.append(sym)
 
-    coins.append(text)
+    coins.extend(added)
     context.user_data['coins'] = coins
-    await update.message.reply_text(
-        f"✅ تم إضافة `{text}`\n"
-        f"العملات الحالية ({len(coins)}): {', '.join(coins)}\n\n"
-        "أرسل عملة أخرى أو اكتب **تم**",
-        parse_mode="Markdown"
-    )
+
+    msg_parts = []
+    if added:
+        msg_parts.append(f"✅ تم إضافة: {', '.join(added)}")
+    if skipped:
+        msg_parts.append(f"⚠️ تم تخطي: {', '.join(skipped)}")
+    msg_parts.append(f"\nالعملات الحالية ({len(coins)}/{max_c}): {', '.join(coins) if coins else 'لا يوجد'}")
+    msg_parts.append("\nأرسل عملات أخرى أو اكتب **تم**")
+    await update.message.reply_text("\n".join(msg_parts), parse_mode="Markdown")
     return WAIT_SEARCH_COIN
 
 
