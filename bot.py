@@ -329,7 +329,13 @@ class ConfirmSellAllView(discord.ui.View):
                 lines.append(f"عدد أوامر البيع: `{len(result['executed'])}`")
             if result.get("errors"):
                 lines.append(f"⚠️ تعذر تنفيذ `{len(result['errors'])}` عملية.")
-            log_action(db, interaction.user.id, "sell_all", str(result), not bool(result.get("errors")))
+            if result.get("skipped"):
+                lines.append(f"ℹ️ تم تخطي `{len(result['skipped'])}` أصل أقل من الحد الأدنى للبيع (1 USDT).")
+            try:
+                log_action(db, interaction.user.id, "sell_all", str(result), not bool(result.get("errors")))
+            except Exception as log_error:
+                logger.warning("Could not write sell_all log: %s", log_error)
+                db.rollback()
             await interaction.followup.send("\n".join(lines), ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ فشل التنظيف الشامل: `{e}`", ephemeral=True)

@@ -101,6 +101,12 @@ def init_db():
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN stopped_at TIMESTAMP"))
                 print("[migration] Added portfolios.stopped_at")
 
+        if "rebalance_logs" in insp.get_table_names():
+            cols = [c["name"] for c in insp.get_columns("rebalance_logs")]
+            if "portfolio_id" not in cols:
+                conn.execute(text("ALTER TABLE rebalance_logs ADD COLUMN portfolio_id INTEGER"))
+                print("[migration] Added rebalance_logs.portfolio_id")
+
 
 def get_or_create_user(db, discord_id: int):
     user = db.query(UserSettings).filter(UserSettings.discord_id == discord_id).first()

@@ -71,6 +71,7 @@ class Rebalancer:
             'action': 'stop',
             'executed': [],
             'errors': [],
+            'skipped': [],
             'dry_run': dry_run,
             'total_sold_usdt': 0.0
         }
@@ -84,6 +85,9 @@ class Rebalancer:
                 continue
             amount = amount * 0.999
             usdt_value = amount * prices.get(coin, 0.0)
+            if usdt_value < 1.0:
+                results['skipped'].append({coin: 'أقل من الحد الأدنى 1 USDT'})
+                continue
             try:
                 if dry_run:
                     results['executed'].append({
