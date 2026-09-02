@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, BigInteger, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, BigInteger, ForeignKey, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
 import config
@@ -26,16 +26,15 @@ class UserSettings(Base):
 
 
 class Portfolio(Base):
-    """Independent portfolio / ملف أعمال"""
+    """Independent portfolio"""
     __tablename__ = "portfolios"
 
     id = Column(Integer, primary_key=True, index=True)
     telegram_id = Column(BigInteger, index=True, nullable=False)
     name = Column(String(100), nullable=False)
-    investment_usdt = Column(Float, default=0.0)          # target investment size
-    status = Column(String(20), default="active")         # active | closed
+    investment_usdt = Column(Float, default=0.0)
+    status = Column(String(20), default="active")
 
-    # Per-portfolio settings
     allocation_method = Column(String(20), default="equal")
     rebalance_mode = Column(String(20), default="threshold")
     threshold = Column(Float, default=2.0)
@@ -72,8 +71,37 @@ class RebalanceLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+def ensure_schema():
+    """يضيف الأعمدة الناقصة أوتوماتيك لو الجدول موجود قديم"""
+    with engine.begin() as conn:
+        # user_settings
+        conn.execute(text("""
+            ALTER TABLE IF EXISTS user_settings
+            ADD COLUMN IF NOT EXISTS default_threshold DOUBLE PRECISION DEFAULT 2.0,
+            ADD COLUMN IF NOT EXISTS default_interval_hours INTEGER DEFAULT 24,
+            ADD COLUMN IF NOT EXISTS default_allocation_method VARCHAR(20) DEFAULT 'equal',
+            ADD COLUMN IF NOT EXISTS default_rebalance_mode VARCHAR(20) DEFAULT 'threshold',
+            ADD COLUMN IF NOT EXISTS min_trade_usdt DOUBLE PRECISION DEFAULT 5.0,
+            ADD COLUMN IF NOT EXISTS max_coins_per_portfolio INTEGER DEFAULT 10,
+            ADD COLUMN IF NOT EXISTS min_usdt_per_coin DOUBLE PRECISION DEFAULT 5.0;
+        """))
+
+        # portfolios
+        conn.execute(text("""
+            ALTER TABLE IF EXISTS portfolios
+            ADD COLUMN IF NOT EXISTS allocation_method VARCHAR(20) DEFAULT 'equal',
+            ADD COLUMN IF NOT EXISTS rebalance_mode VARCHAR(20) DEFAULT 'threshold',
+            ADD COLUMN IF NOT EXISTS threshold DOUBLE PRECISION DEFAULT 2.0,
+            ADD COLUMN IF NOT EXISTS rebalance_interval_hours INTEGER DEFAULT 24,
+            ADD COLUMN IF NOT EXISTS last_rebalance TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP;
+        """))
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
+    ensure_schema()
+    print("DB schema ensured")
 
 
 def get_db():
