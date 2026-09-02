@@ -91,12 +91,13 @@ def portfolios_list_kb(portfolios):
 def portfolio_menu_kb(pf_id):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ تشغيل (شراء)", callback_data=f"pfstart_{pf_id}")],
+        [InlineKeyboardButton("📉 صافي الربح / الخسارة", callback_data=f"pfpnl_{pf_id}")],
         [InlineKeyboardButton("📋 تفاصيل المحفظة", callback_data=f"pfdetail_{pf_id}")],
         [InlineKeyboardButton("🪙 العملات", callback_data=f"pfcoins_{pf_id}")],
         [InlineKeyboardButton("💰 زيادة الاستثمار", callback_data=f"pfincrease_{pf_id}")],
         [InlineKeyboardButton("⚖️ إعادة التوازن", callback_data=f"pfrebalance_{pf_id}")],
         [InlineKeyboardButton("⚙️ إعدادات المحفظة", callback_data=f"pfsettings_{pf_id}")],
-        [InlineKeyboardButton("🛑 إنهاء وبيع المحفظة", callback_data=f"pfclose_{pf_id}")],
+        [InlineKeyboardButton("🛑 بيع رصيد المحفظة", callback_data=f"pfclose_{pf_id}")],
         [InlineKeyboardButton("🔙 محافظي", callback_data="my_portfolios")],
     ])
 
@@ -315,7 +316,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 and not data.startswith("pfsettings_") and not data.startswith("pfclose_") \
                 and not data.startswith("pfaddcoin_") and not data.startswith("pfremovecoin_") \
                 and not data.startswith("pfdry_") and not data.startswith("pfreal_") \
-                and not data.startswith("pfdel_") and not data.startswith("pfstart_"):
+                and not data.startswith("pfdel_") and not data.startswith("pfstart_") and not data.startswith("pfpnl_"):
             pf_id = int(data.split("_")[1])
             p = get_portfolio(db, pf_id, user_id)
             if not p:
@@ -511,12 +512,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ تأكيد البيع والإنهاء", callback_data=f"pfcloseconfirm_{pf_id}")],
+                [InlineKeyboardButton("✅ تأكيد البيع فقط", callback_data=f"pfcloseconfirm_{pf_id}")],
                 [InlineKeyboardButton("❌ إلغاء", callback_data=f"pf_{pf_id}")],
             ])
             await query.edit_message_text(
-                f"🛑 **إنهاء محفظة {p.name}**\n\n"
-                f"سيتم بيع العملات التالية إلى USDT:\n"
+                f"🛑 **بيع رصيد محفظة {p.name}**\n\n"
+                f"سيتم بيع رصيد العملات التالية إلى USDT (المحفظة تبقى):\n"
                 f"{', '.join(f'`{s}`' for s in symbols)}\n\n"
                 "⚠️ إذا كانت نفس العملة موجودة في محافظ أخرى، سيتم بيع الرصيد كله.",
                 reply_markup=kb, parse_mode="Markdown"
@@ -545,16 +546,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     errors.append(f"❌ `{sym}`: {str(e)[:60]}")
 
-            close_portfolio(db, pf_id)
-            log_action(db, user_id, "portfolio_close", f"{p.name}: sold {','.join(symbols)}",
+            log_action(db, user_id, "portfolio_sell", f"{p.name}: sold {','.join(symbols)}",
                        success=len(errors)==0, portfolio_id=pf_id)
 
-            lines = [f"🛑 **تم إنهاء محفظة {p.name}**\n"]
+            lines = [f"🛑 **تم بيع رصيد محفظة {p.name}**\n"]
+            lines.append("(المحفظة ما زالت موجودة ويمكن تشغيلها لاحقاً)\n")
             lines.extend(results)
             if errors:
                 lines.append("\n**أخطاء:**")
                 lines.extend(errors)
-            await query.edit_message_text("\n".join(lines), reply_markup=main_menu_kb(), parse_mode="Markdown")
+            await query.edit_message_text("\n".join(lines), reply_markup=portfolio_menu_kb(pf_id), parse_mode="Markdown")
             return
 
         # ===== GLOBAL SETTINGS =====
