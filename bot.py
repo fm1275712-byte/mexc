@@ -12,7 +12,7 @@ from discord.ext import commands
 import config
 from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
-    create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
+    create_portfolio, clone_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
     close_portfolio, set_portfolio_running, log_action
 )
 from mexc_client import MexcClient
@@ -145,6 +145,18 @@ class MainMenuView(discord.ui.View):
             await interaction.followup.send(format_full_balance(bal), ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"خطأ: `{e}`", ephemeral=True)
+
+    @discord.ui.button(label="تنظيف شامل وبيع كل", style=discord.ButtonStyle.danger, emoji="🧹", row=1)
+    async def clean_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("غير مصرح.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "⚠️ **تحذير: تنظيف شامل**\n"
+            "سيتم بيع جميع العملات غير USDT في حساب MEXC، ولا يمكن التراجع عن أوامر البيع.\n"
+            "هل تريد المتابعة؟",
+            view=ConfirmSellAllView(), ephemeral=True
+        )
 
     @discord.ui.button(label="الإعدادات", style=discord.ButtonStyle.secondary, emoji="⚙️")
     async def settings(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -298,10 +310,72 @@ class PortfolioButton(discord.ui.Button):
             db.close()
 
 
+class ConfirmSellAllView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="نعم، بع كل العملات", style=discord.ButtonStyle.danger, emoji="⚠️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("غير مصرح.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        db = SessionLocal()
+        try:
+            result = get_rebalancer().sell_all_assets(dry_run=False)
+            sold = result.get("total_sold_usdt", 0.0)
+            lines = [f"✅ اكتمل التنظيف الشامل. إجمالي البيع التقريبي: `{sold:.2f} USDT`"]
+            if result.get("executed"):
+                lines.append(f"عدد أوامر البيع: `{len(result['executed'])}`")
+            if result.get("errors"):
+                lines.append(f"⚠️ تعذر تنفيذ `{len(result['errors'])}` عملية.")
+            log_action(db, interaction.user.id, "sell_all", str(result), not bool(result.get("errors")))
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ فشل التنظيف الشامل: `{e}`", ephemeral=True)
+        finally:
+            db.close()
+
+    @discord.ui.button(label="إلغاء", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("تم الإلغاء، لم يتم بيع أي شيء.", ephemeral=True)
+
+
+class PortfolioCopyButton(discord.ui.Button):
+    def __init__(self, portfolio_id: int):
+        super().__init__(label="نسخ المحفظة ٢", style=discord.ButtonStyle.primary, emoji="📋", row=1)
+        self.portfolio_id = portfolio_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("غير مصرح.", ephemeral=True)
+            return
+        db = SessionLocal()
+        try:
+            source = get_portfolio(db, self.portfolio_id, interaction.user.id)
+            if not source:
+                await interaction.response.send_message("المحفظة غير موجودة.", ephemeral=True)
+                return
+            existing = {p.name for p in get_portfolios(db, interaction.user.id, status=None)}
+            name = f"{source.name} 2"
+            number = 2
+            while name in existing:
+                number += 1
+                name = f"{source.name} {number}"
+            copied = clone_portfolio(db, source.id, interaction.user.id, name)
+            await interaction.response.send_message(
+                f"✅ تم نسخ المحفظة باسم **{copied.name}** (متوقفة لحين التشغيل).",
+                view=PortfolioMenuView(copied.id), ephemeral=True
+            )
+        finally:
+            db.close()
+
+
 class PortfolioMenuView(discord.ui.View):
     def __init__(self, portfolio_id: int):
         super().__init__(timeout=300)
         self.portfolio_id = portfolio_id
+        self.add_item(PortfolioCopyButton(portfolio_id))
 
     @discord.ui.button(label="تشغيل الاستراتيجية", style=discord.ButtonStyle.success, emoji="▶️", row=0)
     async def start_strategy(self, interaction: discord.Interaction, button: discord.ui.Button):

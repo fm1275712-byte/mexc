@@ -114,6 +114,15 @@ class Rebalancer:
 
         return results
 
+    def sell_all_assets(self, dry_run: bool = False) -> Dict:
+        """Sell every non-USDT asset currently held in the account."""
+        balances = self.client.get_balance()
+        coins = [
+            symbol for symbol, amount in balances.items()
+            if symbol != self.quote and float(amount or 0) > 0
+        ]
+        return self.stop_portfolio(coins, dry_run=dry_run)
+
     def rebalance_portfolio(
         self,
         coins: List[str],

@@ -149,6 +149,21 @@ def create_portfolio(db, discord_id: int, name: str, investment: float, coins: l
     return p
 
 
+def clone_portfolio(db, portfolio_id: int, discord_id: int, name: str) -> Portfolio:
+    """Create an inactive copy of a portfolio, preserving its configuration."""
+    source = get_portfolio(db, portfolio_id, discord_id)
+    if not source:
+        return None
+    return create_portfolio(
+        db, discord_id, name, source.investment_usdt,
+        [c.symbol for c in source.coins],
+        allocation_method=source.allocation_method,
+        rebalance_mode=source.rebalance_mode,
+        threshold=source.threshold,
+        interval=source.rebalance_interval_hours,
+    )
+
+
 def add_coin_to_portfolio(db, portfolio_id: int, symbol: str, max_coins: int = 10) -> tuple:
     p = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
     if not p:
