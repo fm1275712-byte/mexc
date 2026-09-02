@@ -1,158 +1,207 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List
 from mexc_client import MexcClient
-import config
 
 
 class Rebalancer:
-    def __init__(self, client: MexcClient = None):
-        self.client = client or MexcClient()
-        self.quote = config.QUOTE_ASSET
+    def __init__(self, client: MexcClient):
+        self.client = client
+        self.quote = client.quote
 
-    def calculate_targets(
-        self,
-        selected_coins: List[str],
-        method: str = "equal"
-    ) -> Dict[str, float]:
-        if not selected_coins:
+    def calculate_targets(self, coins: List[str], method: str = "equal") -> Dict[str, float]:
+        if not coins:
             return {}
+        pct = 100.0 / len(coins)
+        return {c: pct for c in coins}
 
-        coins = [c.upper() for c in selected_coins]
-
-        if method == "equal":
-            pct = 100.0 / len(coins)
-            return {c: pct for c in coins}
-
-        # marketcap / by current value in portfolio
-        portfolio = self.client.get_portfolio_value()
-        assets = portfolio.get('assets', {})
-        values = {c: assets.get(c, {}).get('usdt_value', 0.0) for c in coins}
-        total_val = sum(values.values())
-        if total_val <= 0:
-            pct = 100.0 / len(coins)
-            return {c: pct for c in coins}
-        return {c: (v / total_val) * 100 for c, v in values.items()}
-
-    def calculate_rebalance(
+    def start_portfolio(
         self,
-        target_allocations: Dict[str, float],
+        coins: List[str],
+        total_usdt: float,
+        method: str = "equal",
+        min_trade_usdt: float = 5.0,
+        dry_run: bool = False
+    ) -> Dict:
+        """Buy coins using up to total_usdt only (respects allocated capital)."""
+        results = {
+            'action': 'start',
+            'total_usdt': total_usdt,
+            'executed': [],
+            'errors': [],
+            'dry_run': dry_run
+        }
+
+        free_usdt = self.client.get_free_usdt()
+        if free_usdt < total_usdt:
+            results['errors'].append(
+                f"رصيد USDT الحر غير كافٍ. المتاح: `{free_usdt:.2f}$` | المطلوب: `{total_usdt:.2f}$`"
+            )
+            return results
+
+        targets = self.calculate_targets(coins, method)
+        for coin, pct in targets.items():
+            usdt_for_coin = total_usdt * (pct / 100.0)
+            if usdt_for_coin < min_trade_usdt:
+                results['errors'].append(f"`{coin}`: المبلغ صغير جداً ({usdt_for_coin:.2f}$)")
+                continue
+            try:
+                if dry_run:
+                    results['executed'].append({
+                        'symbol': f"{coin}/{self.quote}",
+                        'side': 'buy',
+                        'usdt': usdt_for_coin,
+                        'status': 'dry_run'
+                    })
+                else:
+                    order = self.client.create_market_buy_usdt(coin, usdt_for_coin)
+                    results['executed'].append({
+                        'symbol': f"{coin}/{self.quote}",
+                        'side': 'buy',
+                        'usdt': usdt_for_coin,
+                        'status': 'filled',
+                        'order_id': order.get('id') if order else None
+                    })
+            except Exception as e:
+                results['errors'].append({coin: str(e)})
+
+        return results
+
+    def stop_portfolio(self, coins: List[str], dry_run: bool = False) -> Dict:
+        """Sell all holdings of the given coins. Does not delete portfolio."""
+        results = {
+            'action': 'stop',
+            'executed': [],
+            'errors': [],
+            'dry_run': dry_run,
+            'total_sold_usdt': 0.0
+        }
+
+        balances = self.client.get_balance()
+        prices = self.client.get_all_prices(coins)
+
+        for coin in coins:
+            amount = float(balances.get(coin, 0.0))
+            if amount <= 0:
+                continue
+            amount = amount * 0.999
+            usdt_value = amount * prices.get(coin, 0.0)
+            try:
+                if dry_run:
+                    results['executed'].append({
+                        'symbol': f"{coin}/{self.quote}",
+                        'side': 'sell',
+                        'amount': amount,
+                        'usdt': usdt_value,
+                        'status': 'dry_run'
+                    })
+                    results['total_sold_usdt'] += usdt_value
+                else:
+                    order = self.client.create_market_order(
+                        symbol=f"{coin}/{self.quote}",
+                        side='sell',
+                        amount=amount
+                    )
+                    results['executed'].append({
+                        'symbol': f"{coin}/{self.quote}",
+                        'side': 'sell',
+                        'amount': amount,
+                        'usdt': usdt_value,
+                        'status': 'filled',
+                        'order_id': order.get('id') if order else None
+                    })
+                    results['total_sold_usdt'] += usdt_value
+            except Exception as e:
+                results['errors'].append({coin: str(e)})
+
+        return results
+
+    def rebalance_portfolio(
+        self,
+        coins: List[str],
+        target_capital: float,
+        method: str = "equal",
         threshold: float = 2.0,
         min_trade_usdt: float = 5.0,
-        target_investment: float = None
-    ) -> Tuple[List[dict], Dict]:
-        """
-        target_investment: if set, we try to work with that size (for new portfolios).
-        Otherwise use full current portfolio value of the selected assets + free USDT.
-        """
-        portfolio = self.client.get_portfolio_value()
-        total = portfolio['total_usdt']
-        if total <= 0:
-            return [], portfolio
+        dry_run: bool = False
+    ) -> Dict:
+        """Rebalance only within the portfolio coins / allocated capital."""
+        targets = self.calculate_targets(coins, method)
+        current = self.client.get_coins_value(coins)
+        current_total = current['total_usdt']
+        base = max(target_capital, current_total)
 
-        # If target_investment is given and smaller, we can still rebalance the whole account
-        # for simplicity we rebalance the selected coins relative to their targets
-        # using the full account for now (MEXC doesn't have sub-accounts easily).
-        current = portfolio['assets']
+        results = {
+            'action': 'rebalance',
+            'targets': targets,
+            'current_total': current_total,
+            'target_capital': target_capital,
+            'executed': [],
+            'errors': [],
+            'dry_run': dry_run
+        }
+
+        if current_total <= 0:
+            results['message'] = "المحفظة فارغة. استخدم **تشغيل الاستراتيجية** أولاً."
+            return results
+
         orders = []
+        for coin, target_pct in targets.items():
+            target_usdt = base * (target_pct / 100.0)
+            current_usdt = current['assets'].get(coin, {}).get('usdt_value', 0.0)
+            delta = target_usdt - current_usdt
 
-        total_target = sum(target_allocations.values())
-        if total_target <= 0:
-            return [], portfolio
-        targets = {k.upper(): (v / total_target) * 100 for k, v in target_allocations.items()}
-
-        all_assets = set(list(current.keys()) + list(targets.keys()))
-
-        for asset in all_assets:
-            if asset == self.quote:
+            if abs(delta) < min_trade_usdt:
                 continue
+            if current_total > 0:
+                current_pct = (current_usdt / current_total) * 100
+                if abs(current_pct - target_pct) < threshold:
+                    continue
 
-            current_pct = current.get(asset, {}).get('percent', 0.0)
-            target_pct = targets.get(asset, 0.0)
-
-            # Only rebalance assets that are in targets or currently held and in targets context
-            if asset not in targets and current_pct < 0.1:
-                continue
-
-            diff = target_pct - current_pct
-            if abs(diff) < threshold:
-                continue
-
-            # Use full account total for percentage calculation
-            target_usdt = (target_pct / 100) * total
-            current_usdt = current.get(asset, {}).get('usdt_value', 0.0)
-            delta_usdt = target_usdt - current_usdt
-
-            if abs(delta_usdt) < min_trade_usdt:
-                continue
-
-            price = current.get(asset, {}).get('price') or self.client.get_ticker_price(f"{asset}/{self.quote}")
+            price = current['assets'].get(coin, {}).get('price', 0.0)
             if price <= 0:
                 continue
 
-            amount = abs(delta_usdt) / price
-            side = 'buy' if delta_usdt > 0 else 'sell'
+            amount = abs(delta) / price
+            side = 'buy' if delta > 0 else 'sell'
 
             if side == 'sell':
-                available = current.get(asset, {}).get('amount', 0.0)
+                available = current['assets'].get(coin, {}).get('amount', 0.0)
                 amount = min(amount, available * 0.999)
 
             if amount <= 0:
                 continue
 
             orders.append({
-                'symbol': f"{asset}/{self.quote}",
+                'symbol': f"{coin}/{self.quote}",
                 'side': side,
                 'amount': amount,
-                'usdt_value': abs(delta_usdt),
-                'asset': asset,
-                'current_pct': current_pct,
-                'target_pct': target_pct
+                'usdt': abs(delta),
+                'coin': coin
             })
 
         orders.sort(key=lambda x: 0 if x['side'] == 'sell' else 1)
-        return orders, portfolio
-
-    def execute_rebalance(
-        self,
-        selected_coins: List[str],
-        allocation_method: str = "equal",
-        threshold: float = 2.0,
-        min_trade_usdt: float = 5.0,
-        dry_run: bool = False
-    ) -> Dict:
-        targets = self.calculate_targets(selected_coins, method=allocation_method)
-        orders, portfolio = self.calculate_rebalance(targets, threshold, min_trade_usdt)
-
-        results = {
-            'targets': targets,
-            'portfolio_before': portfolio,
-            'orders_planned': orders,
-            'executed': [],
-            'errors': [],
-            'dry_run': dry_run
-        }
-
-        if not orders:
-            results['message'] = "لا حاجة لإعادة توازن (داخل نسبة الانحراف)"
-            return results
 
         for order in orders:
             try:
                 if dry_run:
                     results['executed'].append({**order, 'status': 'dry_run'})
                 else:
-                    result = self.client.create_market_order(
-                        symbol=order['symbol'],
-                        side=order['side'],
-                        amount=order['amount']
-                    )
+                    if order['side'] == 'buy':
+                        o = self.client.create_market_buy_usdt(order['coin'], order['usdt'])
+                    else:
+                        o = self.client.create_market_order(
+                            symbol=order['symbol'],
+                            side='sell',
+                            amount=order['amount']
+                        )
                     results['executed'].append({
                         **order,
                         'status': 'filled',
-                        'order_id': result.get('id'),
-                        'filled': result.get('filled')
+                        'order_id': o.get('id') if o else None
                     })
             except Exception as e:
-                results['errors'].append({'order': order, 'error': str(e)})
+                results['errors'].append({order['coin']: str(e)})
 
-        results['portfolio_after'] = self.client.get_portfolio_value() if not dry_run else portfolio
+        if not orders:
+            results['message'] = "لا حاجة لإعادة توازن (داخل نسبة الانحراف)"
+
         return results

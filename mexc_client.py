@@ -25,6 +25,10 @@ class MexcClient:
                 free[asset] = float(amount)
         return free
 
+    def get_free_usdt(self) -> float:
+        bal = self.get_balance()
+        return float(bal.get(self.quote, 0.0))
+
     def get_ticker_price(self, symbol: str) -> float:
         """symbol like BTC/USDT"""
         ticker = self.exchange.fetch_ticker(symbol)
@@ -39,17 +43,16 @@ class MexcClient:
                 prices[s] = self.get_ticker_price(pair)
             except Exception:
                 prices[s] = 0.0
-        # Always include USDT price = 1
         prices[self.quote] = 1.0
         return prices
 
     def get_portfolio_value(self) -> Dict:
         """
-        Returns:
+        Returns full account value.
         {
             'total_usdt': float,
             'assets': {
-                'BTC': {'amount': x, 'usdt_value': y, 'percent': z},
+                'BTC': {'amount': x, 'usdt_value': y, 'percent': z, 'price': p},
                 ...
             }
         }
@@ -58,7 +61,6 @@ class MexcClient:
         if not balances:
             return {'total_usdt': 0.0, 'assets': {}}
 
-        # Get prices for all non-quote assets
         assets = [a for a in balances.keys() if a != self.quote]
         prices = self.get_all_prices(assets)
 
@@ -85,6 +87,24 @@ class MexcClient:
             'assets': result_assets
         }
 
+    def get_coins_value(self, symbols: List[str]) -> Dict:
+        """Value of specific coins only (for a virtual portfolio)."""
+        balances = self.get_balance()
+        prices = self.get_all_prices(symbols)
+        total = 0.0
+        details = {}
+        for s in symbols:
+            amount = float(balances.get(s, 0.0))
+            price = prices.get(s, 0.0)
+            usdt_value = amount * price
+            total += usdt_value
+            details[s] = {
+                'amount': amount,
+                'price': price,
+                'usdt_value': usdt_value
+            }
+        return {'total_usdt': total, 'assets': details}
+
     def create_market_order(self, symbol: str, side: str, amount: float) -> Optional[dict]:
         """
         symbol: BTC/USDT
@@ -101,6 +121,27 @@ class MexcClient:
             return order
         except Exception as e:
             raise Exception(f"Order failed: {str(e)}")
+
+    def create_market_buy_usdt(self, symbol: str, usdt_amount: float) -> Optional[dict]:
+        """Buy using quote amount (USDT). Tries create_order with cost, falls back to amount calculation."""
+        pair = f"{symbol}/{self.quote}"
+        try:
+            # Prefer cost-based if supported
+            order = self.exchange.create_order(
+                symbol=pair,
+                type='market',
+                side='buy',
+                amount=None,
+                params={'cost': usdt_amount}
+            )
+            return order
+        except Exception:
+            # Fallback: calculate amount from price
+            price = self.get_ticker_price(pair)
+            if price <= 0:
+                raise Exception(f"Cannot get price for {pair}")
+            amount = (usdt_amount * 0.998) / price   # small buffer for fees
+            return self.create_market_order(pair, 'buy', amount)
 
     def get_markets(self) -> List[str]:
         """Return list of available base assets that have /USDT pair"""

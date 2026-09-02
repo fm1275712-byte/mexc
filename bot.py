@@ -1,8 +1,7 @@
 """
-MEXC Multi-Portfolio Rebalancer - Discord Bot
+MEXC Multi-Portfolio Rebalancer - Discord Bot (Full Control)
 """
 import logging
-import asyncio
 from datetime import datetime
 from typing import Optional
 
@@ -14,7 +13,7 @@ import config
 from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
     create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
-    close_portfolio, log_action
+    close_portfolio, set_portfolio_running, log_action
 )
 from mexc_client import MexcClient
 from rebalancer import Rebalancer
@@ -73,21 +72,26 @@ def format_full_balance(portfolio: dict) -> str:
     return "\n".join(lines)
 
 
-def format_portfolio_detail(p, targets: dict = None) -> str:
+def format_portfolio_detail(p, targets: dict = None, current_value: float = None) -> str:
     coins = [c.symbol for c in p.coins]
     method = "بالتساوي" if p.allocation_method == "equal" else "قيمة سوقية"
     mode = "نسبي %" if p.rebalance_mode == "threshold" else "بالوقت"
+    status_emoji = "🟢 تعمل" if p.is_running else "⚪ متوقفة"
     lines = [
         f"**{p.name}**",
-        f"الحالة: {'🟢 نشطة' if p.status == 'active' else '🔴 منتهية'}",
-        f"الاستثمار المستهدف: `{p.investment_usdt:.2f} USDT`",
+        f"الحالة: {status_emoji}",
+        f"الاستثمار المخصص: `{p.investment_usdt:.2f} USDT`",
+    ]
+    if current_value is not None:
+        lines.append(f"القيمة الحالية: `{current_value:.2f} USDT`")
+    lines += [
         f"عدد العملات: {len(coins)}",
         f"طريقة التوزيع: {method}",
         f"وضع الانحراف: {mode}",
         f"Threshold: {p.threshold}%",
         f"الفترة: {p.rebalance_interval_hours} ساعة",
         "",
-        "**العملات:**",
+        "**العملات:**"
     ]
     if targets:
         for s in coins:
@@ -98,7 +102,7 @@ def format_portfolio_detail(p, targets: dict = None) -> str:
     return "\n".join(lines)
 
 
-# ==================== VIEWS (BUTTONS) ====================
+# ==================== VIEWS ====================
 
 class MainMenuView(discord.ui.View):
     def __init__(self):
@@ -113,36 +117,36 @@ class MainMenuView(discord.ui.View):
         try:
             pfs = get_portfolios(db, interaction.user.id, status="active")
             if not pfs:
-                view = discord.ui.View()
-                view.add_item(discord.ui.Button(label="إنشاء محفظة", style=discord.ButtonStyle.success, custom_id="create_pf"))
-                await interaction.response.send_message("لا توجد محافظ نشطة.", view=CreatePortfolioView(), ephemeral=True)
+                await interaction.response.send_message(
+                    "لا توجد محافظ نشطة.",
+                    view=CreatePortfolioView(),
+                    ephemeral=True
+                )
                 return
-            view = PortfoliosListView(pfs)
-            await interaction.response.send_message("محافظك النشطة:", view=view, ephemeral=True)
+            await interaction.response.send_message("محافظك النشطة:", view=PortfoliosListView(pfs), ephemeral=True)
         finally:
             db.close()
 
     @discord.ui.button(label="إنشاء محفظة", style=discord.ButtonStyle.success, emoji="➕")
-    async def create_pf(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_authorized(interaction.user.id):
             await interaction.response.send_message("غير مصرح.", ephemeral=True)
             return
         await interaction.response.send_modal(CreatePortfolioModal())
 
-    @discord.ui.button(label="رصيد الحساب", style=discord.ButtonStyle.secondary, emoji="📊")
-    async def full_balance(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="رصيد الحساب", style=discord.ButtonStyle.secondary, emoji="💰")
+    async def balance(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_authorized(interaction.user.id):
             await interaction.response.send_message("غير مصرح.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         try:
             bal = get_mexc().get_portfolio_value()
-            text = format_full_balance(bal)
-            await interaction.followup.send(text, ephemeral=True)
+            await interaction.followup.send(format_full_balance(bal), ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"خطأ: `{e}`", ephemeral=True)
 
-    @discord.ui.button(label="الإعدادات العامة", style=discord.ButtonStyle.secondary, emoji="⚙️")
+    @discord.ui.button(label="الإعدادات", style=discord.ButtonStyle.secondary, emoji="⚙️")
     async def settings(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_authorized(interaction.user.id):
             await interaction.response.send_message("غير مصرح.", ephemeral=True)
@@ -176,11 +180,11 @@ class CreatePortfolioView(discord.ui.View):
 
 
 class CreatePortfolioModal(discord.ui.Modal, title="إنشاء محفظة جديدة"):
-    name = discord.ui.TextInput(label="اسم المحفظة", placeholder="مثلاً: محفظة الذكاء الاصطناعي", max_length=80)
+    name = discord.ui.TextInput(label="اسم المحفظة", placeholder="مثلاً: محفظة رئيسية", max_length=80)
     investment = discord.ui.TextInput(label="مبلغ الاستثمار (USDT)", placeholder="مثلاً: 50", max_length=20)
     coins = discord.ui.TextInput(
         label="العملات (مفصولة بمسافة أو فاصلة)",
-        placeholder="BTC ETH ONDO HBAR",
+        placeholder="BTC ETH XRP ADA",
         style=discord.TextStyle.paragraph,
         max_length=200
     )
@@ -202,9 +206,7 @@ class CreatePortfolioModal(discord.ui.Modal, title="إنشاء محفظة جدي
             await interaction.followup.send("أضف عملة واحدة على الأقل.", ephemeral=True)
             return
 
-        # Live check
-        valid = []
-        invalid = []
+        valid, invalid = [], []
         for s in symbols:
             if is_coin_available(s):
                 valid.append(s)
@@ -212,7 +214,7 @@ class CreatePortfolioModal(discord.ui.Modal, title="إنشاء محفظة جدي
                 invalid.append(s)
 
         if not valid:
-            await interaction.followup.send(f"كل العملات غير متاحة على MEXC: {', '.join(invalid)}", ephemeral=True)
+            await interaction.followup.send(f"كل العملات غير متاحة: {', '.join(invalid)}", ephemeral=True)
             return
 
         db = SessionLocal()
@@ -236,7 +238,12 @@ class CreatePortfolioModal(discord.ui.Modal, title="إنشاء محفظة جدي
                 threshold=user.default_threshold,
                 interval=user.default_interval_hours
             )
-            msg = f"✅ تم إنشاء محفظة **{p.name}**\nالاستثمار: `{p.investment_usdt}$`\nالعملات: {', '.join(valid)}"
+            msg = (
+                f"✅ تم إنشاء محفظة **{p.name}**\n"
+                f"الاستثمار المخصص: `{p.investment_usdt}$`\n"
+                f"العملات: {', '.join(valid)}\n\n"
+                f"⚪ المحفظة متوقفة حالياً. اضغط **تشغيل الاستراتيجية** لبدء الشراء."
+            )
             if invalid:
                 msg += f"\n\n⚠️ تم تجاهل (غير متاحة): {', '.join(invalid)}"
             await interaction.followup.send(msg, view=PortfolioMenuView(p.id), ephemeral=True)
@@ -244,17 +251,33 @@ class CreatePortfolioModal(discord.ui.Modal, title="إنشاء محفظة جدي
             db.close()
 
 
+
+class BackToMainButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="رجوع للقائمة الرئيسية", style=discord.ButtonStyle.secondary, emoji="🏠", row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "القائمة الرئيسية:",
+            view=MainMenuView(),
+            ephemeral=True
+        )
+
+
 class PortfoliosListView(discord.ui.View):
     def __init__(self, portfolios):
         super().__init__(timeout=300)
         for p in portfolios[:20]:
             self.add_item(PortfolioButton(p))
+        # زر رجوع
+        self.add_item(BackToMainButton())
 
 
 class PortfolioButton(discord.ui.Button):
     def __init__(self, portfolio):
+        status = "🟢" if portfolio.is_running else "⚪"
         super().__init__(
-            label=f"{portfolio.name} ({portfolio.investment_usdt:.0f}$)",
+            label=f"{status} {portfolio.name} ({portfolio.investment_usdt:.0f}$)",
             style=discord.ButtonStyle.primary,
             custom_id=f"open_pf_{portfolio.id}"
         )
@@ -267,11 +290,10 @@ class PortfolioButton(discord.ui.Button):
             if not p:
                 await interaction.response.send_message("المحفظة غير موجودة.", ephemeral=True)
                 return
-            await interaction.response.send_message(
-                f"المحفظة: **{p.name}**",
-                view=PortfolioMenuView(p.id),
-                ephemeral=True
-            )
+            targets = get_rebalancer().calculate_targets([c.symbol for c in p.coins], p.allocation_method)
+            current = get_mexc().get_coins_value([c.symbol for c in p.coins])
+            text = format_portfolio_detail(p, targets, current["total_usdt"])
+            await interaction.response.send_message(text, view=PortfolioMenuView(p.id), ephemeral=True)
         finally:
             db.close()
 
@@ -281,64 +303,358 @@ class PortfolioMenuView(discord.ui.View):
         super().__init__(timeout=300)
         self.portfolio_id = portfolio_id
 
-    @discord.ui.button(label="تفاصيل", style=discord.ButtonStyle.secondary, emoji="📋")
-    async def detail(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="تشغيل الاستراتيجية", style=discord.ButtonStyle.success, emoji="▶️", row=0)
+    async def start_strategy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("غير مصرح.", ephemeral=True)
+            return
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
+            if not p:
+                await interaction.response.send_message("المحفظة غير موجودة.", ephemeral=True)
+                return
+            if p.is_running:
+                # Already running → ask to increase
+                await interaction.response.send_message(
+                    f"المحفظة **تعمل حالياً**.\nهل تريد زيادة الاستثمار؟\n"
+                    f"المخصص حالياً: `{p.investment_usdt:.2f} USDT`",
+                    view=ConfirmIncreaseView(self.portfolio_id),
+                    ephemeral=True
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            coins = [c.symbol for c in p.coins]
+            if not coins:
+                await interaction.followup.send("أضف عملات أولاً قبل التشغيل.", ephemeral=True)
+                return
+
+            result = get_rebalancer().start_portfolio(
+                coins=coins,
+                total_usdt=p.investment_usdt,
+                method=p.allocation_method,
+                min_trade_usdt=5.0,
+                dry_run=False
+            )
+
+            if result["errors"] and not result["executed"]:
+                err = "\n".join(str(e) for e in result["errors"])
+                await interaction.followup.send(f"❌ فشل التشغيل:\n{err}", ephemeral=True)
+                return
+
+            set_portfolio_running(db, p.id, True)
+            log_action(db, interaction.user.id, "start", str(result.get("executed")), True, p.id)
+
+            lines = [f"✅ تم تشغيل محفظة **{p.name}**\nالمبلغ المستخدم: `{p.investment_usdt:.2f} USDT`\n"]
+            for o in result["executed"]:
+                lines.append(f"• شراء `{o['symbol']}` ≈ {o['usdt']:.2f}$")
+            if result["errors"]:
+                lines.append("\n⚠️ أخطاء جزئية:")
+                for e in result["errors"]:
+                    lines.append(f"• {e}")
+            await interaction.followup.send("\n".join(lines), view=PortfolioMenuView(p.id), ephemeral=True)
+        finally:
+            db.close()
+
+    @discord.ui.button(label="إيقاف", style=discord.ButtonStyle.danger, emoji="⏹️", row=0)
+    async def stop_strategy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("غير مصرح.", ephemeral=True)
+            return
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
+            if not p:
+                await interaction.response.send_message("المحفظة غير موجودة.", ephemeral=True)
+                return
+            if not p.is_running:
+                await interaction.response.send_message("المحفظة متوقفة أصلاً.", ephemeral=True)
+                return
+
+            await interaction.response.send_message(
+                f"⚠️ هل أنت متأكد من **إيقاف** محفظة **{p.name}**؟\n"
+                f"سيتم بيع كل عملات المحفظة وتحويلها لـ USDT.\n"
+                f"(المحفظة نفسها لن تُحذف)",
+                view=ConfirmStopView(self.portfolio_id),
+                ephemeral=True
+            )
+        finally:
+            db.close()
+
+    @discord.ui.button(label="زيادة استثمار", style=discord.ButtonStyle.primary, emoji="💰", row=1)
+    async def increase(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(IncreaseInvestmentModal(self.portfolio_id))
+
+    @discord.ui.button(label="إعادة توازن", style=discord.ButtonStyle.primary, emoji="⚖️", row=1)
+    async def rebalance(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
+            if not p:
+                await interaction.response.send_message("المحفظة غير موجودة.", ephemeral=True)
+                return
+            if not p.is_running:
+                await interaction.response.send_message(
+                    "المحفظة متوقفة. شغّلها أولاً قبل إعادة التوازن.",
+                    ephemeral=True
+                )
+                return
+            await interaction.response.send_message(
+                "اختر نوع إعادة التوازن:",
+                view=RebalanceView(self.portfolio_id),
+                ephemeral=True
+            )
+        finally:
+            db.close()
+
+    @discord.ui.button(label="العملات", style=discord.ButtonStyle.secondary, emoji="🪙", row=2)
+    async def coins(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "إدارة عملات المحفظة:",
+            view=CoinsManageView(self.portfolio_id),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="تفاصيل", style=discord.ButtonStyle.secondary, emoji="📋", row=2)
+    async def details(self, interaction: discord.Interaction, button: discord.ui.Button):
         db = SessionLocal()
         try:
             p = get_portfolio(db, self.portfolio_id, interaction.user.id)
             if not p:
                 await interaction.response.send_message("غير موجودة.", ephemeral=True)
                 return
-            symbols = [c.symbol for c in p.coins]
-            targets = get_rebalancer().calculate_targets(symbols, p.allocation_method)
-            text = format_portfolio_detail(p, targets)
+            coins = [c.symbol for c in p.coins]
+            targets = get_rebalancer().calculate_targets(coins, p.allocation_method)
+            current = get_mexc().get_coins_value(coins)
+            text = format_portfolio_detail(p, targets, current["total_usdt"])
             await interaction.response.send_message(text, view=PortfolioMenuView(self.portfolio_id), ephemeral=True)
         finally:
             db.close()
 
-    @discord.ui.button(label="العملات", style=discord.ButtonStyle.secondary, emoji="🪙")
-    async def coins(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="إنهاء المحفظة", style=discord.ButtonStyle.danger, emoji="🗑️", row=3)
+    async def close_pf(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "⚠️ هل أنت متأكد من **إنهاء** المحفظة نهائياً؟\n"
+            "إذا كانت تعمل سيتم بيع العملات أولاً ثم حذف الإعدادات.",
+            view=ConfirmCloseView(self.portfolio_id),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="القائمة الرئيسية", style=discord.ButtonStyle.secondary, emoji="🏠", row=4)
+    async def main_menu(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "القائمة الرئيسية:",
+            view=MainMenuView(),
+            ephemeral=True
+        )
+
+
+class ConfirmIncreaseView(discord.ui.View):
+    def __init__(self, portfolio_id: int):
+        super().__init__(timeout=60)
+        self.portfolio_id = portfolio_id
+
+    @discord.ui.button(label="نعم، زيادة الاستثمار", style=discord.ButtonStyle.success)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(IncreaseInvestmentModal(self.portfolio_id, also_buy=True))
+
+    @discord.ui.button(label="لا", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("تم الإلغاء.", view=PortfolioMenuView(self.portfolio_id), ephemeral=True)
+
+
+class ConfirmStopView(discord.ui.View):
+    def __init__(self, portfolio_id: int):
+        super().__init__(timeout=60)
+        self.portfolio_id = portfolio_id
+
+    @discord.ui.button(label="نعم، أوقف وبيع", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         db = SessionLocal()
         try:
             p = get_portfolio(db, self.portfolio_id, interaction.user.id)
             if not p:
-                await interaction.response.send_message("غير موجودة.", ephemeral=True)
+                await interaction.followup.send("المحفظة غير موجودة.", ephemeral=True)
                 return
-            symbols = [c.symbol for c in p.coins]
-            text = f"**عملات {p.name}:**\n" + ("\n".join(f"• `{s}`" for s in symbols) if symbols else "لا توجد")
-            await interaction.response.send_message(text, view=CoinsManageView(self.portfolio_id), ephemeral=True)
+            coins = [c.symbol for c in p.coins]
+            result = get_rebalancer().stop_portfolio(coins, dry_run=False)
+            set_portfolio_running(db, p.id, False)
+            log_action(db, interaction.user.id, "stop", str(result.get("executed")), True, p.id)
+
+            lines = [
+                f"⏹️ تم إيقاف محفظة **{p.name}**",
+                f"تم بيع ≈ `{result.get('total_sold_usdt', 0):.2f} USDT`",
+                "",
+                "المحفظة محفوظة ويمكن تشغيلها لاحقاً."
+            ]
+            for o in result.get("executed", []):
+                lines.append(f"• بيع `{o['symbol']}` ≈ {o.get('usdt', 0):.2f}$")
+            if result.get("errors"):
+                lines.append("\n⚠️ أخطاء:")
+                for e in result["errors"]:
+                    lines.append(f"• {e}")
+            await interaction.followup.send("\n".join(lines), view=PortfolioMenuView(p.id), ephemeral=True)
         finally:
             db.close()
 
-    @discord.ui.button(label="زيادة استثمار", style=discord.ButtonStyle.primary, emoji="💰")
-    async def increase(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(IncreaseInvestmentModal(self.portfolio_id))
+    @discord.ui.button(label="إلغاء", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("تم الإلغاء.", view=PortfolioMenuView(self.portfolio_id), ephemeral=True)
 
-    @discord.ui.button(label="إعادة توازن", style=discord.ButtonStyle.success, emoji="⚖️")
-    async def rebalance(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            "إعادة توازن المحفظة:",
-            view=RebalanceView(self.portfolio_id),
-            ephemeral=True
-        )
 
-    @discord.ui.button(label="إنهاء المحفظة", style=discord.ButtonStyle.danger, emoji="🛑")
-    async def close_pf(self, interaction: discord.Interaction, button: discord.ui.Button):
+class ConfirmCloseView(discord.ui.View):
+    def __init__(self, portfolio_id: int):
+        super().__init__(timeout=60)
+        self.portfolio_id = portfolio_id
+
+    @discord.ui.button(label="نعم، أنهِ المحفظة", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         db = SessionLocal()
         try:
             p = get_portfolio(db, self.portfolio_id, interaction.user.id)
-            if p:
-                close_portfolio(db, self.portfolio_id)
-                await interaction.response.send_message(f"✅ تم إنهاء محفظة **{p.name}**", ephemeral=True)
-            else:
-                await interaction.response.send_message("غير موجودة.", ephemeral=True)
+            if not p:
+                await interaction.followup.send("غير موجودة.", ephemeral=True)
+                return
+            if p.is_running:
+                coins = [c.symbol for c in p.coins]
+                get_rebalancer().stop_portfolio(coins, dry_run=False)
+            close_portfolio(db, p.id)
+            log_action(db, interaction.user.id, "close", p.name, True, p.id)
+            await interaction.followup.send(f"✅ تم إنهاء محفظة **{p.name}**.", ephemeral=True)
+        finally:
+            db.close()
+
+    @discord.ui.button(label="إلغاء", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("تم الإلغاء.", view=PortfolioMenuView(self.portfolio_id), ephemeral=True)
+
+
+class IncreaseInvestmentModal(discord.ui.Modal, title="زيادة الاستثمار"):
+    def __init__(self, portfolio_id: int, also_buy: bool = False):
+        super().__init__()
+        self.portfolio_id = portfolio_id
+        self.also_buy = also_buy
+        self.amount = discord.ui.TextInput(label="المبلغ الإضافي (USDT)", placeholder="20", max_length=20)
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            val = float(str(self.amount.value).strip())
+            if val <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("رقم غير صحيح.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
+            if not p:
+                await interaction.followup.send("المحفظة غير موجودة.", ephemeral=True)
+                return
+
+            p.investment_usdt += val
+            db.commit()
+
+            msg = f"✅ تم زيادة استثمار **{p.name}** بمبلغ `{val}$`\nالإجمالي المخصص: `{p.investment_usdt:.2f}$`"
+
+            if self.also_buy and p.is_running:
+                # Buy the extra amount proportionally
+                coins = [c.symbol for c in p.coins]
+                result = get_rebalancer().start_portfolio(
+                    coins=coins,
+                    total_usdt=val,
+                    method=p.allocation_method,
+                    min_trade_usdt=5.0,
+                    dry_run=False
+                )
+                if result["executed"]:
+                    msg += "\n\nتم شراء المبلغ الإضافي:"
+                    for o in result["executed"]:
+                        msg += f"\n• `{o['symbol']}` ≈ {o['usdt']:.2f}$"
+                if result["errors"]:
+                    msg += "\n\n⚠️ " + str(result["errors"])
+
+            await interaction.followup.send(msg, view=PortfolioMenuView(self.portfolio_id), ephemeral=True)
+        finally:
+            db.close()
+
+
+class RebalanceView(discord.ui.View):
+    def __init__(self, portfolio_id: int):
+        super().__init__(timeout=180)
+        self.portfolio_id = portfolio_id
+
+    @discord.ui.button(label="معاينة (Dry Run)", style=discord.ButtonStyle.secondary, emoji="🔍")
+    async def dry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run(interaction, dry_run=True)
+
+    @discord.ui.button(label="تنفيذ فعلي", style=discord.ButtonStyle.danger, emoji="✅")
+    async def real(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run(interaction, dry_run=False)
+
+    @discord.ui.button(label="رجوع", style=discord.ButtonStyle.secondary, emoji="◀️", row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "قائمة المحفظة:",
+            view=PortfolioMenuView(self.portfolio_id),
+            ephemeral=True
+        )
+
+    async def _run(self, interaction: discord.Interaction, dry_run: bool):
+        await interaction.response.defer(ephemeral=True)
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
+            if not p:
+                await interaction.followup.send("غير موجودة.", ephemeral=True)
+                return
+            coins = [c.symbol for c in p.coins]
+            result = get_rebalancer().rebalance_portfolio(
+                coins=coins,
+                target_capital=p.investment_usdt,
+                method=p.allocation_method,
+                threshold=p.threshold,
+                min_trade_usdt=5.0,
+                dry_run=dry_run
+            )
+
+            lines = [f"{'🔍 معاينة' if dry_run else '✅ تنفيذ'} إعادة توازن **{p.name}**\n"]
+            if result.get("message"):
+                lines.append(result["message"])
+            for o in result.get("executed", []):
+                side_ar = "شراء" if o["side"] == "buy" else "بيع"
+                lines.append(f"• {side_ar} `{o['symbol']}` ≈ {o.get('usdt', 0):.2f}$")
+            if result.get("errors"):
+                lines.append("\n⚠️ أخطاء:")
+                for e in result["errors"]:
+                    lines.append(f"• {e}")
+
+            log_action(
+                db, interaction.user.id,
+                "rebalance_dry" if dry_run else "rebalance",
+                str(result.get("executed", [])),
+                success=not result["errors"],
+                portfolio_id=self.portfolio_id
+            )
+            if not dry_run and result.get("executed"):
+                p.last_rebalance = datetime.utcnow()
+                db.commit()
+
+            await interaction.followup.send("\n".join(lines), view=RebalanceView(self.portfolio_id), ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"خطأ: `{e}`", ephemeral=True)
         finally:
             db.close()
 
 
 class CoinsManageView(discord.ui.View):
     def __init__(self, portfolio_id: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=180)
         self.portfolio_id = portfolio_id
 
     @discord.ui.button(label="إضافة عملة", style=discord.ButtonStyle.success, emoji="🔍")
@@ -410,105 +726,6 @@ class AddCoinModal(discord.ui.Modal, title="إضافة عملة"):
             db.close()
 
 
-class IncreaseInvestmentModal(discord.ui.Modal, title="زيادة الاستثمار"):
-    def __init__(self, portfolio_id: int):
-        super().__init__()
-        self.portfolio_id = portfolio_id
-        self.amount = discord.ui.TextInput(label="المبلغ الإضافي (USDT)", placeholder="20", max_length=20)
-        self.add_item(self.amount)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            val = float(str(self.amount.value).strip())
-            if val <= 0:
-                raise ValueError
-        except ValueError:
-            await interaction.response.send_message("رقم غير صحيح.", ephemeral=True)
-            return
-        db = SessionLocal()
-        try:
-            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
-            if not p:
-                await interaction.response.send_message("المحفظة غير موجودة.", ephemeral=True)
-                return
-            p.investment_usdt += val
-            db.commit()
-            await interaction.response.send_message(
-                f"✅ تم زيادة استثمار **{p.name}** بمبلغ {val}$\nالإجمالي: `{p.investment_usdt:.2f}$`",
-                view=PortfolioMenuView(self.portfolio_id),
-                ephemeral=True
-            )
-        finally:
-            db.close()
-
-
-class RebalanceView(discord.ui.View):
-    def __init__(self, portfolio_id: int):
-        super().__init__(timeout=180)
-        self.portfolio_id = portfolio_id
-
-    @discord.ui.button(label="معاينة (Dry Run)", style=discord.ButtonStyle.secondary, emoji="🔍")
-    async def dry(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._run(interaction, dry_run=True)
-
-    @discord.ui.button(label="تنفيذ فعلي", style=discord.ButtonStyle.danger, emoji="✅")
-    async def real(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._run(interaction, dry_run=False)
-
-    async def _run(self, interaction: discord.Interaction, dry_run: bool):
-        await interaction.response.defer(ephemeral=True)
-        db = SessionLocal()
-        try:
-            p = get_portfolio(db, self.portfolio_id, interaction.user.id)
-            if not p or not p.coins:
-                await interaction.followup.send("المحفظة فارغة من العملات.", ephemeral=True)
-                return
-            user = get_or_create_user(db, interaction.user.id)
-            symbols = [c.symbol for c in p.coins]
-            result = get_rebalancer().execute_rebalance(
-                selected_coins=symbols,
-                allocation_method=p.allocation_method,
-                threshold=p.threshold,
-                min_trade_usdt=user.min_trade_usdt,
-                dry_run=dry_run
-            )
-            lines = ["🔍 **معاينة**\n" if dry_run else "✅ **تم التنفيذ**\n"]
-            lines.append("**النسب المستهدفة:**")
-            for s, pct in result.get("targets", {}).items():
-                lines.append(f"• `{s}` → {pct:.1f}%")
-            lines.append("")
-            if result.get("message"):
-                lines.append(result["message"])
-            else:
-                for o in result["executed"]:
-                    lines.append(
-                        f"• {o['side'].upper()} `{o['asset']}` "
-                        f"{o['amount']:.6f} ≈ {o['usdt_value']:.2f}$ "
-                        f"({o['current_pct']:.1f}%→{o['target_pct']:.1f}%)"
-                    )
-                if result["errors"]:
-                    lines.append("\n❌ أخطاء:")
-                    for e in result["errors"]:
-                        lines.append(f"• {e['error']}")
-
-            log_action(
-                db, interaction.user.id,
-                "rebalance_dry" if dry_run else "rebalance",
-                str(result.get("executed", [])),
-                success=not result["errors"],
-                portfolio_id=self.portfolio_id
-            )
-            if not dry_run:
-                p.last_rebalance = datetime.utcnow()
-                db.commit()
-
-            await interaction.followup.send("\n".join(lines), view=RebalanceView(self.portfolio_id), ephemeral=True)
-        except Exception as e:
-            await interaction.followup.send(f"خطأ: `{e}`", ephemeral=True)
-        finally:
-            db.close()
-
-
 class GlobalSettingsView(discord.ui.View):
     def __init__(self, user):
         super().__init__(timeout=300)
@@ -541,6 +758,14 @@ class GlobalSettingsView(discord.ui.View):
     @discord.ui.button(label="تعديل Threshold", style=discord.ButtonStyle.secondary)
     async def set_threshold(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ThresholdModal())
+
+    @discord.ui.button(label="رجوع للقائمة الرئيسية", style=discord.ButtonStyle.secondary, emoji="🏠", row=2)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "القائمة الرئيسية:",
+            view=MainMenuView(),
+            ephemeral=True
+        )
 
 
 class ThresholdModal(discord.ui.Modal, title="تعديل Threshold"):
@@ -589,12 +814,12 @@ async def start_cmd(interaction: discord.Interaction):
 
     text = (
         f"مرحباً **{interaction.user.display_name}** 👋\n\n"
-        "بوت **محافظ MEXC المتعددة**\n\n"
-        "• أنشئ محافظ منفصلة\n"
-        "• كل محفظة لها عملاتها وإعداداتها واستثمارها\n"
-        "• تحكم كامل (إضافة/حذف عملات، زيادة استثمار، إعادة توازن، إنهاء)\n"
-        "• الحد الأدنى 5$ لكل عملة\n"
-        "• البحث لحظي عن توفر العملة على MEXC"
+        "بوت **محافظ MEXC المتعددة** - تحكم كامل\n\n"
+        "• أنشئ محافظ منفصلة بمبلغ مخصص\n"
+        "• **تشغيل الاستراتيجية** → يشتري بالمبلغ المخصص فقط\n"
+        "• **إيقاف** → يبيع ويرجع الفلوس بدون حذف المحفظة\n"
+        "• زيادة استثمار / إعادة توازن / إدارة عملات\n"
+        "• يحترم المبلغ المخصص لكل محفظة"
     )
     await interaction.response.send_message(text, view=MainMenuView(), ephemeral=True)
 
