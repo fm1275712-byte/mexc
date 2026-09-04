@@ -12,7 +12,7 @@ class UserSettings(Base):
     __tablename__ = "user_settings"
 
     id = Column(Integer, primary_key=True, index=True)
-    discord_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
     default_threshold = Column(Float, default=2.0)
     default_interval_hours = Column(Integer, default=24)
     default_allocation_method = Column(String(20), default="equal")
@@ -28,7 +28,7 @@ class Portfolio(Base):
     __tablename__ = "portfolios"
 
     id = Column(Integer, primary_key=True, index=True)
-    discord_id = Column(BigInteger, index=True, nullable=False)
+    telegram_id = Column(BigInteger, index=True, nullable=False)
     name = Column(String(100), nullable=False)
     investment_usdt = Column(Float, default=0.0)
     status = Column(String(20), default="active")
@@ -64,7 +64,7 @@ class RebalanceLog(Base):
     __tablename__ = "rebalance_logs"
 
     id = Column(Integer, primary_key=True, index=True)
-    discord_id = Column(BigInteger, index=True)
+    telegram_id = Column(BigInteger, index=True)
     portfolio_id = Column(Integer, nullable=True)
     action = Column(String(50))
     details = Column(Text)
@@ -82,12 +82,13 @@ def init_db():
             if table not in insp.get_table_names():
                 continue
             cols = [c["name"] for c in insp.get_columns(table)]
-            if "telegram_id" in cols and "discord_id" not in cols:
-                conn.execute(text(f'ALTER TABLE {table} RENAME COLUMN telegram_id TO discord_id'))
-                print(f"[migration] Renamed {table}.telegram_id → discord_id")
-            elif "telegram_id" in cols and "discord_id" in cols:
-                conn.execute(text(f'ALTER TABLE {table} DROP COLUMN telegram_id'))
-                print(f"[migration] Dropped leftover {table}.telegram_id")
+            # migrate discord_id -> telegram_id
+            if "discord_id" in cols and "telegram_id" not in cols:
+                conn.execute(text(f'ALTER TABLE {table} RENAME COLUMN discord_id TO telegram_id'))
+                print(f"[migration] Renamed {table}.discord_id → telegram_id")
+            elif "discord_id" in cols and "telegram_id" in cols:
+                conn.execute(text(f'ALTER TABLE {table} DROP COLUMN discord_id'))
+                print(f"[migration] Dropped leftover {table}.discord_id")
 
         if "portfolios" in insp.get_table_names():
             cols = [c["name"] for c in insp.get_columns("portfolios")]
@@ -96,47 +97,39 @@ def init_db():
                 print("[migration] Added portfolios.is_running")
             if "started_at" not in cols:
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN started_at TIMESTAMP"))
-                print("[migration] Added portfolios.started_at")
             if "stopped_at" not in cols:
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN stopped_at TIMESTAMP"))
-                print("[migration] Added portfolios.stopped_at")
-
-        if "rebalance_logs" in insp.get_table_names():
-            cols = [c["name"] for c in insp.get_columns("rebalance_logs")]
-            if "portfolio_id" not in cols:
-                conn.execute(text("ALTER TABLE rebalance_logs ADD COLUMN portfolio_id INTEGER"))
-                print("[migration] Added rebalance_logs.portfolio_id")
 
 
-def get_or_create_user(db, discord_id: int):
-    user = db.query(UserSettings).filter(UserSettings.discord_id == discord_id).first()
+def get_or_create_user(db, telegram_id: int):
+    user = db.query(UserSettings).filter(UserSettings.telegram_id == telegram_id).first()
     if not user:
-        user = UserSettings(discord_id=discord_id)
+        user = UserSettings(telegram_id=telegram_id)
         db.add(user)
         db.commit()
         db.refresh(user)
     return user
 
 
-def get_portfolios(db, discord_id: int, status: str = "active"):
-    q = db.query(Portfolio).filter(Portfolio.discord_id == discord_id)
+def get_portfolios(db, telegram_id: int, status: str = "active"):
+    q = db.query(Portfolio).filter(Portfolio.telegram_id == telegram_id)
     if status:
         q = q.filter(Portfolio.status == status)
     return q.order_by(Portfolio.created_at.desc()).all()
 
 
-def get_portfolio(db, portfolio_id: int, discord_id: int = None):
+def get_portfolio(db, portfolio_id: int, telegram_id: int = None):
     q = db.query(Portfolio).filter(Portfolio.id == portfolio_id)
-    if discord_id:
-        q = q.filter(Portfolio.discord_id == discord_id)
+    if telegram_id:
+        q = q.filter(Portfolio.telegram_id == telegram_id)
     return q.first()
 
 
-def create_portfolio(db, discord_id: int, name: str, investment: float, coins: list,
+def create_portfolio(db, telegram_id: int, name: str, investment: float, coins: list,
                      allocation_method: str = "equal", rebalance_mode: str = "threshold",
                      threshold: float = 2.0, interval: int = 24) -> Portfolio:
     p = Portfolio(
-        discord_id=discord_id,
+        telegram_id=telegram_id,
         name=name,
         investment_usdt=investment,
         allocation_method=allocation_method,
@@ -153,21 +146,6 @@ def create_portfolio(db, discord_id: int, name: str, investment: float, coins: l
     db.commit()
     db.refresh(p)
     return p
-
-
-def clone_portfolio(db, portfolio_id: int, discord_id: int, name: str) -> Portfolio:
-    """Create an inactive copy of a portfolio, preserving its configuration."""
-    source = get_portfolio(db, portfolio_id, discord_id)
-    if not source:
-        return None
-    return create_portfolio(
-        db, discord_id, name, source.investment_usdt,
-        [c.symbol for c in source.coins],
-        allocation_method=source.allocation_method,
-        rebalance_mode=source.rebalance_mode,
-        threshold=source.threshold,
-        interval=source.rebalance_interval_hours,
-    )
 
 
 def add_coin_to_portfolio(db, portfolio_id: int, symbol: str, max_coins: int = 10) -> tuple:
@@ -217,9 +195,9 @@ def set_portfolio_running(db, portfolio_id: int, running: bool):
     return None
 
 
-def log_action(db, discord_id: int, action: str, details: str, success: bool = True, portfolio_id: int = None):
+def log_action(db, telegram_id: int, action: str, details: str, success: bool = True, portfolio_id: int = None):
     log = RebalanceLog(
-        discord_id=discord_id,
+        telegram_id=telegram_id,
         portfolio_id=portfolio_id,
         action=action,
         details=details,

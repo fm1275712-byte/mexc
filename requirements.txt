@@ -1,4 +1,4 @@
-discord.py==2.4.0
+python-telegram-bot==21.6
 ccxt==4.4.82
 SQLAlchemy==2.0.36
 psycopg2-binary==2.9.10
