@@ -105,12 +105,13 @@ def kb_portfolio(pf_id: int, is_running: bool = False):
         ],
         [
             InlineKeyboardButton("⚖️  إعادة توازن", callback_data=f"reb_{pf_id}"),
-            InlineKeyboardButton("🪙  العملات", callback_data=f"coins_{pf_id}"),
+            InlineKeyboardButton("🔄  تحديث", callback_data=f"pf_{pf_id}"),
         ],
         [
-            InlineKeyboardButton("🔄  تحديث", callback_data=f"pf_{pf_id}"),
-            InlineKeyboardButton("🗑️  إنهاء المحفظة", callback_data=f"close_{pf_id}"),
+            InlineKeyboardButton("➕  إضافة عملة", callback_data=f"addcoin_{pf_id}"),
+            InlineKeyboardButton("🗑️  حذف عملة", callback_data=f"removecoin_{pf_id}"),
         ],
+        [InlineKeyboardButton("🗑️  إنهاء المحفظة", callback_data=f"close_{pf_id}")],
         [InlineKeyboardButton("◀️  رجوع — محافظي", callback_data="my_pfs")],
         [InlineKeyboardButton("🏠  القائمة الرئيسية", callback_data="main")],
     ])
@@ -121,16 +122,6 @@ def kb_rebalance(pf_id: int):
         [
             InlineKeyboardButton("🔍  معاينة فقط", callback_data=f"dry_{pf_id}"),
             InlineKeyboardButton("✅  تنفيذ فعلي", callback_data=f"real_{pf_id}"),
-        ],
-        [InlineKeyboardButton("◀️  رجوع للمحفظة", callback_data=f"pf_{pf_id}")],
-    ])
-
-
-def kb_coins(pf_id: int):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("➕  إضافة عملة", callback_data=f"addcoin_{pf_id}"),
-            InlineKeyboardButton("🗑️  حذف عملة", callback_data=f"removecoin_{pf_id}"),
         ],
         [InlineKeyboardButton("◀️  رجوع للمحفظة", callback_data=f"pf_{pf_id}")],
     ])
@@ -582,18 +573,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ---- Coins manage ----
-        if data.startswith("coins_"):
-            pf_id = int(data.split("_")[1])
-            p = get_portfolio(db, pf_id, user_id)
-            if not p:
-                await query.edit_message_text("غير موجودة.", reply_markup=kb_back_main())
-                return
-            coins = [c.symbol for c in p.coins]
-            text = f"*عملات — {p.name}*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            text += (" · ".join(f"`{c}`" for c in coins) if coins else "لا توجد عملات بعد.")
-            await query.edit_message_text(text, reply_markup=kb_coins(pf_id), parse_mode="Markdown")
-            return
-
         if data.startswith("addcoin_"):
             pf_id = int(data.split("_")[1])
             context.user_data["add_coin_pf"] = pf_id
@@ -607,10 +586,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pf_id = int(data.split("_")[1])
             p = get_portfolio(db, pf_id, user_id)
             if not p or not p.coins:
-                await query.edit_message_text("لا توجد عملات.", reply_markup=kb_coins(pf_id), parse_mode="Markdown")
+                await query.edit_message_text("لا توجد عملات للحذف.", reply_markup=kb_portfolio(pf_id), parse_mode="Markdown")
                 return
             buttons = [[InlineKeyboardButton(f"🗑️ {c.symbol}", callback_data=f"del_{pf_id}_{c.symbol}")] for c in p.coins]
-            buttons.append([InlineKeyboardButton("◀️  رجوع", callback_data=f"coins_{pf_id}")])
+            buttons.append([InlineKeyboardButton("◀️  رجوع للمحفظة", callback_data=f"pf_{pf_id}")])
             await query.edit_message_text("اختر العملة للحذف:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
             return
 
@@ -619,9 +598,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pf_id = int(parts[1])
             symbol = parts[2]
             remove_coin_from_portfolio(db, pf_id, symbol)
+            p = get_portfolio(db, pf_id, user_id)
+            coins = [c.symbol for c in p.coins] if p else []
+            targets = get_rebalancer().calculate_targets(coins, p.allocation_method) if p else {}
+            current = get_mexc().get_coins_value(coins) if p else {"total_usdt": 0}
             await query.edit_message_text(
-                f"✅ تم حذف `{symbol}`",
-                reply_markup=kb_coins(pf_id),
+                f"✅ تم حذف `{symbol}`\n\n" + (txt_portfolio(p, targets, current["total_usdt"]) if p else ""),
+                reply_markup=kb_portfolio(pf_id, p.is_running if p else False),
                 parse_mode="Markdown"
             )
             return
@@ -759,7 +742,15 @@ async def wait_add_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = get_or_create_user(db, update.effective_user.id)
         ok, msg = add_coin_to_portfolio(db, pf_id, sym, max_coins=user.max_coins_per_portfolio)
-        await update.message.reply_text(msg, reply_markup=kb_coins(pf_id), parse_mode="Markdown")
+        p = get_portfolio(db, pf_id, update.effective_user.id)
+        coins = [c.symbol for c in p.coins] if p else []
+        targets = get_rebalancer().calculate_targets(coins, p.allocation_method) if p else {}
+        current = get_mexc().get_coins_value(coins) if p else {"total_usdt": 0}
+        await update.message.reply_text(
+            msg + "\n\n" + (txt_portfolio(p, targets, current["total_usdt"]) if p else ""),
+            reply_markup=kb_portfolio(pf_id, p.is_running if p else False),
+            parse_mode="Markdown"
+        )
     finally:
         db.close()
         context.user_data.pop("add_coin_pf", None)
