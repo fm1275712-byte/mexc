@@ -1178,47 +1178,74 @@ async def wait_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_any_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Listen in groups for messages from registered signal bots (bot API)."""
+    """Listen in groups/channels for signal messages from registered sources."""
     msg = update.effective_message
     if not msg or not msg.text:
         return
-    user = msg.from_user
-    if not user:
-        return
-    # only groups/supergroups for auto signals (private uses test UI)
     chat = update.effective_chat
     if not chat or chat.type not in ("group", "supergroup", "channel"):
         return
 
     db = SessionLocal()
     try:
-        # match against any admin's signal bots — typically single ADMIN
         admin = int(config.ADMIN_TELEGRAM_ID) if config.ADMIN_TELEGRAM_ID else None
         if not admin:
+            logger.warning("signal skipped: ADMIN_TELEGRAM_ID not set")
             return
         bots = get_enabled_signal_bots(db, admin)
         if not bots:
             return
-        uid = user.id
-        uname = (user.username or "").lower()
+
+        # Collect possible source ids/usernames from the post
+        candidates_ids = set()
+        candidates_names = set()
+        source_label = "unknown"
+
+        user = msg.from_user
+        if user:
+            candidates_ids.add(int(user.id))
+            if user.username:
+                candidates_names.add(user.username.lower())
+            source_label = user.username or str(user.id)
+
+        # Channel posts often have sender_chat (the channel) and no from_user
+        sender_chat = getattr(msg, "sender_chat", None)
+        if sender_chat:
+            candidates_ids.add(int(sender_chat.id))
+            if getattr(sender_chat, "username", None):
+                candidates_names.add(sender_chat.username.lower())
+            source_label = getattr(sender_chat, "username", None) or str(sender_chat.id)
+
+        # The chat itself (channel/group id) can be registered as source
+        candidates_ids.add(int(chat.id))
+        if getattr(chat, "username", None):
+            candidates_names.add(chat.username.lower())
+
         matched = False
         for b in bots:
-            if b.bot_id and int(b.bot_id) == uid:
+            if b.bot_id and int(b.bot_id) in candidates_ids:
                 matched = True
+                source_label = b.label or str(b.bot_id)
                 break
-            if b.bot_username and b.bot_username.lower() == uname:
+            if b.bot_username and b.bot_username.lower().lstrip("@") in candidates_names:
                 matched = True
+                source_label = b.bot_username
                 break
         if not matched:
+            logger.info(
+                "signal ignored (no source match) chat=%s ids=%s names=%s",
+                chat.id, candidates_ids, candidates_names
+            )
             return
+
         result = await process_signal_text(
-            msg.text, source=uname or str(uid), context=context,
+            msg.text, source=str(source_label), context=context,
             notify_chat_id=admin, force_test=False
         )
         try:
             await context.bot.send_message(chat_id=admin, text=result, parse_mode="Markdown")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("notify admin failed: %s", e)
     finally:
         db.close()
 
@@ -1292,7 +1319,15 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_any_text_message))
+    # groups + channel posts (channel_post updates need explicit filter)
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
+        on_any_text_message
+    ))
+    app.add_handler(MessageHandler(
+        filters.UpdateType.CHANNEL_POSTS & filters.TEXT,
+        on_any_text_message
+    ))
 
     logger.info("Starting Telegram bot (polling)...")
     app.run_polling(drop_pending_updates=True)
