@@ -114,6 +114,65 @@ class Rebalancer:
 
         return results
 
+
+    def stop_partial(self, coins: list, sell_usdt: float, dry_run: bool = False) -> dict:
+        """Sell approximately sell_usdt worth of the portfolio coins (pro-rata)."""
+        results = {
+            'action': 'stop_partial',
+            'sell_usdt_target': sell_usdt,
+            'executed': [],
+            'errors': [],
+            'dry_run': dry_run,
+            'total_sold_usdt': 0.0
+        }
+        current = self.client.get_coins_value(coins)
+        total = current['total_usdt']
+        if total <= 0:
+            results['errors'].append("المحفظة فارغة، لا يوجد ما يُباع")
+            return results
+
+        # fraction of holdings to sell
+        frac = min(1.0, max(0.0, sell_usdt / total))
+        balances = self.client.get_balance()
+        prices = self.client.get_all_prices(coins)
+
+        for coin in coins:
+            amount = float(balances.get(coin, 0.0)) * frac * 0.999
+            if amount <= 0:
+                continue
+            usdt_value = amount * prices.get(coin, 0.0)
+            if usdt_value < 1.0:  # skip dust
+                continue
+            try:
+                if dry_run:
+                    results['executed'].append({
+                        'symbol': f"{coin}/{self.quote}",
+                        'side': 'sell',
+                        'amount': amount,
+                        'usdt': usdt_value,
+                        'status': 'dry_run'
+                    })
+                    results['total_sold_usdt'] += usdt_value
+                else:
+                    order = self.client.create_market_order(
+                        symbol=f"{coin}/{self.quote}",
+                        side='sell',
+                        amount=amount
+                    )
+                    results['executed'].append({
+                        'symbol': f"{coin}/{self.quote}",
+                        'side': 'sell',
+                        'amount': amount,
+                        'usdt': usdt_value,
+                        'status': 'filled',
+                        'order_id': order.get('id') if order else None
+                    })
+                    results['total_sold_usdt'] += usdt_value
+            except Exception as e:
+                results['errors'].append({coin: str(e)})
+
+        return results
+
     def rebalance_portfolio(
         self,
         coins: List[str],

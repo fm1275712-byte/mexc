@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
     WAIT_ADD_COIN,
     WAIT_INCREASE,
     WAIT_THRESHOLD,
-) = range(6)
+    WAIT_EDIT_ALLOC,
+) = range(7)
 
 mexc = None
 rebalancer = None
@@ -70,12 +71,12 @@ def is_coin_available(symbol: str) -> bool:
 def kb_main():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📁 محافظي", callback_data="my_pfs"),
-            InlineKeyboardButton("✨ إنشاء محفظة", callback_data="create_pf"),
+            InlineKeyboardButton("📁  محافظي", callback_data="my_pfs"),
+            InlineKeyboardButton("✨  إنشاء محفظة", callback_data="create_pf"),
         ],
         [
-            InlineKeyboardButton("💎 رصيد الحساب", callback_data="balance"),
-            InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings"),
+            InlineKeyboardButton("💎  رصيد الحساب", callback_data="balance"),
+            InlineKeyboardButton("⚙️  الإعدادات", callback_data="settings"),
         ],
     ])
 
@@ -83,123 +84,120 @@ def kb_main():
 def kb_portfolios(portfolios):
     rows = []
     for p in portfolios[:15]:
-        status = "🟢" if p.is_running else "⚪"
+        icon = "🟢" if p.is_running else "⚪"
         rows.append([InlineKeyboardButton(
-            f"{status}  {p.name}  ·  {p.investment_usdt:.0f}$",
+            f"{icon}  {p.name}  ·  {p.investment_usdt:.0f} USDT",
             callback_data=f"pf_{p.id}"
         )])
-    rows.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main")])
+    rows.append([InlineKeyboardButton("◀️  رجوع للقائمة الرئيسية", callback_data="main")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_portfolio(pf_id: int, is_running: bool):
+def kb_portfolio(pf_id: int, is_running: bool = False):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("▶️ تشغيل", callback_data=f"start_{pf_id}"),
-            InlineKeyboardButton("⏹️ إيقاف", callback_data=f"stop_{pf_id}"),
+            InlineKeyboardButton("▶️  تشغيل", callback_data=f"start_{pf_id}"),
+            InlineKeyboardButton("⏹️  إيقاف", callback_data=f"stop_{pf_id}"),
         ],
         [
-            InlineKeyboardButton("💰 زيادة استثمار", callback_data=f"inc_{pf_id}"),
-            InlineKeyboardButton("⚖️ إعادة توازن", callback_data=f"reb_{pf_id}"),
+            InlineKeyboardButton("💰  زيادة استثمار", callback_data=f"inc_{pf_id}"),
+            InlineKeyboardButton("✏️  تعديل المخصص", callback_data=f"editalloc_{pf_id}"),
         ],
         [
-            InlineKeyboardButton("🪙 العملات", callback_data=f"coins_{pf_id}"),
-            InlineKeyboardButton("📋 تفاصيل", callback_data=f"detail_{pf_id}"),
+            InlineKeyboardButton("⚖️  إعادة توازن", callback_data=f"reb_{pf_id}"),
+            InlineKeyboardButton("🪙  العملات", callback_data=f"coins_{pf_id}"),
         ],
-        [InlineKeyboardButton("🗑️ إنهاء المحفظة", callback_data=f"close_{pf_id}")],
         [
-            InlineKeyboardButton("◀️ محافظي", callback_data="my_pfs"),
-            InlineKeyboardButton("🏠 الرئيسية", callback_data="main"),
+            InlineKeyboardButton("🔄  تحديث", callback_data=f"pf_{pf_id}"),
+            InlineKeyboardButton("🗑️  إنهاء المحفظة", callback_data=f"close_{pf_id}"),
         ],
+        [InlineKeyboardButton("◀️  رجوع — محافظي", callback_data="my_pfs")],
+        [InlineKeyboardButton("🏠  القائمة الرئيسية", callback_data="main")],
     ])
 
 
 def kb_rebalance(pf_id: int):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔍 معاينة", callback_data=f"dry_{pf_id}"),
-            InlineKeyboardButton("✅ تنفيذ", callback_data=f"real_{pf_id}"),
+            InlineKeyboardButton("🔍  معاينة فقط", callback_data=f"dry_{pf_id}"),
+            InlineKeyboardButton("✅  تنفيذ فعلي", callback_data=f"real_{pf_id}"),
         ],
-        [InlineKeyboardButton("◀️ رجوع", callback_data=f"pf_{pf_id}")],
+        [InlineKeyboardButton("◀️  رجوع للمحفظة", callback_data=f"pf_{pf_id}")],
     ])
 
 
 def kb_coins(pf_id: int):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("➕ إضافة عملة", callback_data=f"addcoin_{pf_id}"),
-            InlineKeyboardButton("🗑️ حذف عملة", callback_data=f"removecoin_{pf_id}"),
+            InlineKeyboardButton("➕  إضافة عملة", callback_data=f"addcoin_{pf_id}"),
+            InlineKeyboardButton("🗑️  حذف عملة", callback_data=f"removecoin_{pf_id}"),
         ],
-        [InlineKeyboardButton("◀️ رجوع", callback_data=f"pf_{pf_id}")],
+        [InlineKeyboardButton("◀️  رجوع للمحفظة", callback_data=f"pf_{pf_id}")],
     ])
 
 
 def kb_confirm_stop(pf_id: int):
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ نعم، أوقف وبيع", callback_data=f"dostop_{pf_id}"),
-            InlineKeyboardButton("❌ إلغاء", callback_data=f"pf_{pf_id}"),
-        ],
+        [InlineKeyboardButton("✅  نعم — أوقف وبيع", callback_data=f"dostop_{pf_id}")],
+        [InlineKeyboardButton("◀️  رجوع — إلغاء", callback_data=f"pf_{pf_id}")],
     ])
 
 
 def kb_confirm_close(pf_id: int):
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ نعم، أنهِ نهائياً", callback_data=f"doclose_{pf_id}"),
-            InlineKeyboardButton("❌ إلغاء", callback_data=f"pf_{pf_id}"),
-        ],
+        [InlineKeyboardButton("✅  نعم — إنهاء نهائي", callback_data=f"doclose_{pf_id}")],
+        [InlineKeyboardButton("◀️  رجوع — إلغاء", callback_data=f"pf_{pf_id}")],
     ])
 
 
 def kb_confirm_increase(pf_id: int):
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ نعم، زيادة", callback_data=f"doinc_{pf_id}"),
-            InlineKeyboardButton("❌ إلغاء", callback_data=f"pf_{pf_id}"),
-        ],
+        [InlineKeyboardButton("✅  نعم — زيادة الاستثمار", callback_data=f"doinc_{pf_id}")],
+        [InlineKeyboardButton("◀️  رجوع — إلغاء", callback_data=f"pf_{pf_id}")],
     ])
 
 
 def kb_settings():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("تبديل طريقة التوزيع", callback_data="tog_method")],
-        [InlineKeyboardButton("تبديل وضع الانحراف", callback_data="tog_mode")],
-        [InlineKeyboardButton("تعديل Threshold", callback_data="set_threshold")],
-        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main")],
+        [InlineKeyboardButton("🔄  تبديل طريقة التوزيع", callback_data="tog_method")],
+        [InlineKeyboardButton("🔄  تبديل وضع الانحراف", callback_data="tog_mode")],
+        [InlineKeyboardButton("📊  تعديل Threshold", callback_data="set_threshold")],
+        [InlineKeyboardButton("◀️  رجوع للقائمة الرئيسية", callback_data="main")],
     ])
 
 
 def kb_back_main():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️  رجوع للقائمة الرئيسية", callback_data="main")],
+    ])
 
 
 def kb_cancel():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="main")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️  إلغاء والرجوع", callback_data="main")],
+    ])
 
 
 # ==================== TEXT HELPERS ====================
 
 def txt_main(name: str) -> str:
     return (
-        f"◈  *MEXC Portfolio Manager*\n\n"
-        f"مرحباً *{name}*\n\n"
-        f"نظام إدارة محافظ متقدم على MEXC\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"• محافظ متعددة بمبالغ مخصصة\n"
-        f"• تشغيل / إيقاف الاستراتيجية\n"
-        f"• إعادة توازن ذكية\n"
-        f"• لا يمس الرصيد خارج المحفظة"
+        f"*MEXC Portfolio Manager*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"مرحباً *{name}* 👋\n\n"
+        f"إدارة محافظ متعددة على منصة MEXC\n"
+        f"بتحكم كامل ومبلغ مخصص لكل محفظة.\n\n"
+        f"اختر من القائمة بالأسفل:"
     )
 
 
 def txt_portfolio(p, targets=None, current_value=None) -> str:
-    status = "🟢 تعمل" if p.is_running else "⚪ متوقفة"
+    status = "🟢 *تعمل*" if p.is_running else "⚪ *متوقفة*"
     method = "بالتساوي" if p.allocation_method == "equal" else "قيمة سوقية"
     coins = [c.symbol for c in p.coins]
     lines = [
-        f"◈  *{p.name}*",
-        f"━━━━━━━━━━━━━━━━",
+        f"*{p.name}*",
+        "━━━━━━━━━━━━━━━━━━━━",
         f"الحالة: {status}",
         f"المخصص: `{p.investment_usdt:.2f} USDT`",
     ]
@@ -208,11 +206,12 @@ def txt_portfolio(p, targets=None, current_value=None) -> str:
     lines += [
         f"التوزيع: {method}",
         f"Threshold: `{p.threshold}%`",
-        f"العملات: `{len(coins)}`",
         "",
-        "*توزيع العملات:*",
+        f"*العملات ({len(coins)}):*",
     ]
-    if targets:
+    if not coins:
+        lines.append("— لا توجد عملات —")
+    elif targets:
         for s in coins:
             lines.append(f"• `{s}` → *{targets.get(s, 0):.1f}%*")
     else:
@@ -223,11 +222,19 @@ def txt_portfolio(p, targets=None, current_value=None) -> str:
 
 def txt_balance(data: dict) -> str:
     if data["total_usdt"] <= 0:
-        return "◈  *رصيد الحساب*\n\nالحساب فارغ حالياً."
-    lines = [f"◈  *رصيد الحساب*\n", f"*الإجمالي:* `{data['total_usdt']:.4f} USDT`\n"]
+        return "*رصيد الحساب*\n━━━━━━━━━━━━━━━━━━━━\n\nالحساب فارغ حالياً."
+    lines = [
+        "*رصيد الحساب*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"*الإجمالي:* `{data['total_usdt']:.4f} USDT`",
+        "",
+        "*الأصول:*",
+    ]
     sorted_assets = sorted(data["assets"].items(), key=lambda x: x[1]["usdt_value"], reverse=True)
     for asset, d in sorted_assets[:15]:
-        lines.append(f"• `{asset}`  {d['amount']:.6f}  ·  `{d['usdt_value']:.2f}$`  ({d['percent']:.1f}%)")
+        lines.append(
+            f"• `{asset}`  {d['amount']:.6f}  ·  `{d['usdt_value']:.2f}$`  ({d['percent']:.1f}%)"
+        )
     return "\n".join(lines)
 
 
@@ -292,7 +299,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             method = "بالتساوي" if user.default_allocation_method == "equal" else "قيمة سوقية"
             mode = "نسبي %" if user.default_rebalance_mode == "threshold" else "بالوقت"
             text = (
-                f"◈  *الإعدادات العامة*\n\n"
+                f"*الإعدادات العامة*\n━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"• التوزيع: `{method}`\n"
                 f"• الانحراف: `{mode}`\n"
                 f"• Threshold: `{user.default_threshold}%`\n"
@@ -332,15 +339,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pfs = get_portfolios(db, user_id, status="active")
             if not pfs:
                 await query.edit_message_text(
-                    "لا توجد محافظ نشطة.\nاضغط *إنشاء محفظة* للبدء.",
+                    "*محافظي*\n━━━━━━━━━━━━━━━━━━━━\n\nلا توجد محافظ نشطة بعد.\nأنشئ محفظة جديدة للبدء.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("✨ إنشاء محفظة", callback_data="create_pf")],
-                        [InlineKeyboardButton("🏠 الرئيسية", callback_data="main")],
+                        [InlineKeyboardButton("✨  إنشاء محفظة", callback_data="create_pf")],
+                        [InlineKeyboardButton("◀️  رجوع للقائمة الرئيسية", callback_data="main")],
                     ]),
                     parse_mode="Markdown"
                 )
                 return
-            lines = ["◈  *محافظك النشطة*\n"]
+            lines = ["*محافظك النشطة*", "━━━━━━━━━━━━━━━━━━━━", ""]
             for p in pfs:
                 status = "🟢" if p.is_running else "⚪"
                 lines.append(f"{status}  *{p.name}*  ·  `{p.investment_usdt:.0f}$`")
@@ -352,7 +359,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             context.user_data["creating"] = True
             await query.edit_message_text(
-                "◈  *إنشاء محفظة جديدة*\n\nأرسل *اسم* المحفظة:\nأو /cancel",
+                "*إنشاء محفظة جديدة*\n━━━━━━━━━━━━━━━━━━━━\n\nالخطوة 1/3\nأرسل *اسم المحفظة*:\n\nللإلغاء: /cancel",
                 parse_mode="Markdown"
             )
             return WAIT_PF_NAME
@@ -374,23 +381,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # ---- Detail ----
-        if data.startswith("detail_"):
-            pf_id = int(data.split("_")[1])
-            p = get_portfolio(db, pf_id, user_id)
-            if not p:
-                await query.edit_message_text("غير موجودة.", reply_markup=kb_back_main())
-                return
-            coins = [c.symbol for c in p.coins]
-            targets = get_rebalancer().calculate_targets(coins, p.allocation_method)
-            current = get_mexc().get_coins_value(coins)
-            await query.edit_message_text(
-                txt_portfolio(p, targets, current["total_usdt"]),
-                reply_markup=kb_portfolio(p.id, p.is_running),
-                parse_mode="Markdown"
-            )
-            return
-
         # ---- Start Strategy ----
         if data.startswith("start_"):
             pf_id = int(data.split("_")[1])
@@ -401,7 +391,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if p.is_running:
                 await query.edit_message_text(
-                    f"⚠️ المحفظة *{p.name}* تعمل حالياً.\nالمخصص: `{p.investment_usdt:.2f} USDT`\n\nهل تريد زيادة الاستثمار؟",
+                    f"ℹ️ المحفظة *{p.name}* تعمل بالفعل.\n\nالمخصص الحالي: `{p.investment_usdt:.2f} USDT`\n\nهل تريد *زيادة* مبلغ الاستثمار؟",
                     reply_markup=kb_confirm_increase(pf_id),
                     parse_mode="Markdown"
                 )
@@ -451,7 +441,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["increase_pf"] = pf_id
             context.user_data["also_buy"] = True
             await query.edit_message_text(
-                "أرسل المبلغ الإضافي بالـ USDT (مثلاً: `20`):\nأو /cancel",
+                "◈  *زيادة استثمار*\n\nأرسل المبلغ *الإضافي* بالـ USDT (مثلاً: `20`):\nسيتم إضافته على المخصص الحالي.\nأو /cancel",
                 parse_mode="Markdown"
             )
             return WAIT_INCREASE
@@ -467,7 +457,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("المحفظة متوقفة أصلاً.", reply_markup=kb_portfolio(pf_id, False), parse_mode="Markdown")
                 return
             await query.edit_message_text(
-                f"⚠️ هل أنت متأكد من *إيقاف* محفظة *{p.name}*؟\n\nسيتم بيع كل العملات وتحويلها لـ USDT.\nالمحفظة نفسها *لن تُحذف*.",
+                f"⚠️ *تأكيد الإيقاف*\n\nالمحفظة: *{p.name}*\n\nسيتم بيع عملات المحفظة وتحويلها إلى USDT.\nالمحفظة *لن تُحذف* ويمكن تشغيلها لاحقاً.",
                 reply_markup=kb_confirm_stop(pf_id),
                 parse_mode="Markdown"
             )
@@ -504,13 +494,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # ---- Edit allocated amount ----
+        if data.startswith("editalloc_"):
+            pf_id = int(data.split("_")[1])
+            p = get_portfolio(db, pf_id, user_id)
+            if not p:
+                await query.edit_message_text("غير موجودة.", reply_markup=kb_back_main())
+                return
+            context.user_data["edit_alloc_pf"] = pf_id
+            await query.edit_message_text(
+                f"◈  *تعديل المبلغ المخصص*\n\n"
+                f"المحفظة: *{p.name}*\n"
+                f"المخصص الحالي: `{p.investment_usdt:.2f} USDT`\n\n"
+                f"أرسل *المبلغ الجديد* بالـ USDT (مثلاً: `100`):\n"
+                f"⚠️ يغيّر الرقم فقط بدون شراء أو بيع.\nأو /cancel",
+                parse_mode="Markdown"
+            )
+            return WAIT_EDIT_ALLOC
+
         # ---- Increase Investment ----
         if data.startswith("inc_"):
             pf_id = int(data.split("_")[1])
             context.user_data["increase_pf"] = pf_id
             context.user_data["also_buy"] = False
             await query.edit_message_text(
-                "أرسل المبلغ الإضافي بالـ USDT (مثلاً: `20`):\nأو /cancel",
+                "◈  *زيادة استثمار*\n\nأرسل المبلغ *الإضافي* بالـ USDT (مثلاً: `20`):\nسيتم إضافته على المخصص الحالي.\nأو /cancel",
                 parse_mode="Markdown"
             )
             return WAIT_INCREASE
@@ -530,7 +538,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             await query.edit_message_text(
-                f"◈  *إعادة توازن* — {p.name}\n\nاختر نوع العملية:",
+                f"*إعادة التوازن*\n━━━━━━━━━━━━━━━━━━━━\n\nالمحفظة: *{p.name}*\n\n🔍 معاينة — بدون تنفيذ\n✅ تنفيذ — صفقات حقيقية",
                 reply_markup=kb_rebalance(pf_id),
                 parse_mode="Markdown"
             )
@@ -581,8 +589,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("غير موجودة.", reply_markup=kb_back_main())
                 return
             coins = [c.symbol for c in p.coins]
-            text = f"◈  *عملات* {p.name}\n\n"
-            text += (" · ".join(f"`{c}`" for c in coins) if coins else "لا توجد عملات")
+            text = f"*عملات — {p.name}*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            text += (" · ".join(f"`{c}`" for c in coins) if coins else "لا توجد عملات بعد.")
             await query.edit_message_text(text, reply_markup=kb_coins(pf_id), parse_mode="Markdown")
             return
 
@@ -602,7 +610,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("لا توجد عملات.", reply_markup=kb_coins(pf_id), parse_mode="Markdown")
                 return
             buttons = [[InlineKeyboardButton(f"🗑️ {c.symbol}", callback_data=f"del_{pf_id}_{c.symbol}")] for c in p.coins]
-            buttons.append([InlineKeyboardButton("◀️ رجوع", callback_data=f"coins_{pf_id}")])
+            buttons.append([InlineKeyboardButton("◀️  رجوع", callback_data=f"coins_{pf_id}")])
             await query.edit_message_text("اختر العملة للحذف:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
             return
 
@@ -626,7 +634,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("غير موجودة.", reply_markup=kb_back_main())
                 return
             await query.edit_message_text(
-                f"⚠️ هل أنت متأكد من *إنهاء* محفظة *{p.name}* نهائياً؟\n\nإذا كانت تعمل سيتم بيع العملات أولاً ثم حذف الإعدادات.",
+                f"⚠️ *تأكيد الإنهاء النهائي*\n\nالمحفظة: *{p.name}*\n\n• إن كانت تعمل → يتم البيع أولاً\n• ثم حذف المحفظة نهائياً\n\nلا يمكن التراجع.",
                 reply_markup=kb_confirm_close(pf_id),
                 parse_mode="Markdown"
             )
@@ -808,6 +816,46 @@ async def wait_increase(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def wait_edit_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = float((update.message.text or "").strip())
+        if val < 5:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("أدخل مبلغ صحيح (حد أدنى 5) أو /cancel")
+        return WAIT_EDIT_ALLOC
+
+    pf_id = context.user_data.get("edit_alloc_pf")
+    if not pf_id:
+        await update.message.reply_text("انتهت الجلسة.", reply_markup=kb_main())
+        return ConversationHandler.END
+
+    db = SessionLocal()
+    try:
+        p = get_portfolio(db, pf_id, update.effective_user.id)
+        if not p:
+            await update.message.reply_text("المحفظة غير موجودة.", reply_markup=kb_main())
+            return ConversationHandler.END
+
+        old = p.investment_usdt
+        p.investment_usdt = val
+        db.commit()
+
+        coins = [c.symbol for c in p.coins]
+        targets = get_rebalancer().calculate_targets(coins, p.allocation_method)
+        current = get_mexc().get_coins_value(coins)
+        msg = f"✅ تم تعديل المخصص\nمن `{old:.2f}$` → `{val:.2f}$`\n\n⚠️ لم يتم شراء أو بيع — الرقم فقط."
+        await update.message.reply_text(
+            msg + "\n\n" + txt_portfolio(p, targets, current["total_usdt"]),
+            reply_markup=kb_portfolio(pf_id, p.is_running),
+            parse_mode="Markdown"
+        )
+    finally:
+        db.close()
+        context.user_data.clear()
+    return ConversationHandler.END
+
+
 async def wait_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         val = float((update.message.text or "").strip())
@@ -843,15 +891,41 @@ def main():
 
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
+    # Callbacks work inside every conversation state + as entry points
+    cb = CallbackQueryHandler(button_handler)
+    text_filters = filters.TEXT & ~filters.COMMAND
+
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler)],
+        entry_points=[cb],
         states={
-            WAIT_PF_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_pf_name)],
-            WAIT_PF_INVESTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_pf_investment)],
-            WAIT_PF_COINS: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_pf_coins)],
-            WAIT_ADD_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_add_coin)],
-            WAIT_INCREASE: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_increase)],
-            WAIT_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_threshold)],
+            WAIT_PF_NAME: [
+                MessageHandler(text_filters, wait_pf_name),
+                cb,
+            ],
+            WAIT_PF_INVESTMENT: [
+                MessageHandler(text_filters, wait_pf_investment),
+                cb,
+            ],
+            WAIT_PF_COINS: [
+                MessageHandler(text_filters, wait_pf_coins),
+                cb,
+            ],
+            WAIT_ADD_COIN: [
+                MessageHandler(text_filters, wait_add_coin),
+                cb,
+            ],
+            WAIT_INCREASE: [
+                MessageHandler(text_filters, wait_increase),
+                cb,
+            ],
+            WAIT_THRESHOLD: [
+                MessageHandler(text_filters, wait_threshold),
+                cb,
+            ],
+            WAIT_EDIT_ALLOC: [
+                MessageHandler(text_filters, wait_edit_alloc),
+                cb,
+            ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel), CommandHandler("start", cmd_start)],
         per_message=False,
@@ -861,8 +935,6 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(conv)
-    # also handle callbacks outside conversation
-    app.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info("Starting Telegram bot (polling)...")
     app.run_polling(drop_pending_updates=True)

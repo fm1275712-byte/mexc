@@ -31,6 +31,7 @@ class Portfolio(Base):
     telegram_id = Column(BigInteger, index=True, nullable=False)
     name = Column(String(100), nullable=False)
     investment_usdt = Column(Float, default=0.0)
+    base_investment = Column(Float, default=0.0)  # amount kept after partial stop / original start
     status = Column(String(20), default="active")
     is_running = Column(Boolean, default=False)
 
@@ -99,6 +100,9 @@ def init_db():
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN started_at TIMESTAMP"))
             if "stopped_at" not in cols:
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN stopped_at TIMESTAMP"))
+            if "base_investment" not in cols:
+                conn.execute(text("ALTER TABLE portfolios ADD COLUMN base_investment DOUBLE PRECISION DEFAULT 0"))
+                print("[migration] Added portfolios.base_investment")
 
 
 def get_or_create_user(db, telegram_id: int):
