@@ -13,8 +13,12 @@ import config
 from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
     create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
-    close_portfolio, set_portfolio_running, log_action
+    close_portfolio, set_portfolio_running, log_action,
+    get_signal_settings, list_signal_bots, add_signal_bot, remove_signal_bot,
+    get_enabled_signal_bots,
 )
+from signal_parser import evaluate_signal
+import signal_listener
 from mexc_client import MexcClient
 from rebalancer import Rebalancer
 
@@ -30,7 +34,10 @@ logger = logging.getLogger(__name__)
     WAIT_INCREASE,
     WAIT_THRESHOLD,
     WAIT_EDIT_ALLOC,
-) = range(7)
+    WAIT_SIGNAL_BOT,
+    WAIT_SIGNAL_THRESH,
+    WAIT_SIGNAL_TEST,
+) = range(10)
 
 mexc = None
 rebalancer = None
@@ -76,6 +83,9 @@ def kb_main():
         ],
         [
             InlineKeyboardButton("💎  رصيد الحساب", callback_data="balance"),
+            InlineKeyboardButton("📡  إشارات", callback_data="signals"),
+        ],
+        [
             InlineKeyboardButton("⚙️  الإعدادات", callback_data="settings"),
         ],
     ])
@@ -169,6 +179,33 @@ def kb_cancel():
     ])
 
 
+
+def kb_signals(enabled: bool):
+    status = "🟢 مفعّل" if enabled else "🔴 متوقف"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"الحالة: {status}", callback_data="sig_toggle")],
+        [InlineKeyboardButton("🤖  إدارة بوتات الإشارات", callback_data="sig_bots")],
+        [InlineKeyboardButton("📊  تعديل شروط الإشارة", callback_data="sig_rules")],
+        [InlineKeyboardButton("🧪  رسالة تجريبية (تست)", callback_data="sig_test")],
+        [InlineKeyboardButton("◀️  رجوع للقائمة الرئيسية", callback_data="main")],
+    ])
+
+
+def kb_sig_bots():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕  إضافة بوت إشارة", callback_data="sig_bot_add")],
+        [InlineKeyboardButton("🗑️  حذف بوت", callback_data="sig_bot_del_menu")],
+        [InlineKeyboardButton("◀️  رجوع — إشارات", callback_data="signals")],
+    ])
+
+
+def kb_sig_rules():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️  تعديل حد البيع/الشراء (M)", callback_data="sig_set_thresh")],
+        [InlineKeyboardButton("◀️  رجوع — إشارات", callback_data="signals")],
+    ])
+
+
 # ==================== TEXT HELPERS ====================
 
 def txt_main(name: str) -> str:
@@ -227,6 +264,100 @@ def txt_balance(data: dict) -> str:
             f"• `{asset}`  {d['amount']:.6f}  ·  `{d['usdt_value']:.2f}$`  ({d['percent']:.1f}%)"
         )
     return "\n".join(lines)
+
+
+
+# ==================== SIGNAL EXECUTION ====================
+
+async def execute_signal_action(action: str, amount: float, reason: str, notify_chat_id: int, context) -> str:
+    """Sell all running portfolios OR start all stopped portfolios."""
+    db = SessionLocal()
+    lines = [f"📡 *تنفيذ إشارة*", f"السبب: {reason}", ""]
+    try:
+        pfs = get_portfolios(db, int(config.ADMIN_TELEGRAM_ID or notify_chat_id), status="active")
+        if not pfs:
+            return "لا توجد محافظ نشطة لتنفيذ الإشارة."
+
+        if action == "sell":
+            lines.append("🔴 *بيع فوري — كل المحافظ الشغالة*")
+            for p in pfs:
+                if not p.is_running:
+                    lines.append(f"• {p.name}: متوقفة (تخطي)")
+                    continue
+                coins = [c.symbol for c in p.coins]
+                result = get_rebalancer().stop_portfolio(coins, dry_run=False)
+                set_portfolio_running(db, p.id, False)
+                sold = result.get("total_sold_usdt", 0)
+                lines.append(f"• {p.name}: بيع ≈ `{sold:.2f}$`")
+                log_action(db, p.telegram_id, "signal_sell", reason, True, p.id)
+
+        elif action == "buy":
+            lines.append("🟢 *شراء فوري — تشغيل كل المحافظ*")
+            for p in pfs:
+                coins = [c.symbol for c in p.coins]
+                if not coins:
+                    lines.append(f"• {p.name}: بدون عملات (تخطي)")
+                    continue
+                if p.is_running:
+                    lines.append(f"• {p.name}: تعمل بالفعل (تخطي)")
+                    continue
+                result = get_rebalancer().start_portfolio(
+                    coins=coins, total_usdt=p.investment_usdt,
+                    method=p.allocation_method, min_trade_usdt=5.0, dry_run=False
+                )
+                if result.get("executed"):
+                    set_portfolio_running(db, p.id, True)
+                    lines.append(f"• {p.name}: تشغيل بمخصص `{p.investment_usdt:.0f}$`")
+                else:
+                    err = result.get("errors") or ["فشل"]
+                    lines.append(f"• {p.name}: خطأ {err[0]}")
+                log_action(db, p.telegram_id, "signal_buy", reason, bool(result.get("executed")), p.id)
+        else:
+            return "إجراء غير معروف"
+
+        # save last signal
+        admin_id = int(config.ADMIN_TELEGRAM_ID or notify_chat_id)
+        s = get_signal_settings(db, admin_id)
+        from datetime import datetime as dt
+        s.last_signal_at = dt.utcnow()
+        s.last_signal_action = action
+        s.last_signal_text = reason[:500]
+        db.commit()
+    finally:
+        db.close()
+
+    msg = "\n".join(lines)
+    try:
+        await context.bot.send_message(chat_id=notify_chat_id, text=msg, parse_mode="Markdown")
+    except Exception:
+        pass
+    return msg
+
+
+async def process_signal_text(text: str, source: str, context, notify_chat_id: int, force_test: bool = False) -> str:
+    db = SessionLocal()
+    try:
+        admin_id = int(config.ADMIN_TELEGRAM_ID or notify_chat_id)
+        settings = get_signal_settings(db, admin_id)
+        if not settings.enabled and not force_test:
+            return "نظام الإشارات متوقف. فعّله من قائمة 📡 إشارات."
+
+        action, amount, reason = evaluate_signal(
+            text,
+            settings.sell_threshold_m,
+            settings.buy_threshold_m,
+            settings.sell_keywords,
+            settings.buy_keywords,
+        )
+        report = f"المصدر: `{source}`\n{reason}"
+        if action is None:
+            return f"🧪 تحليل الإشارة\n{report}\n\n❌ لم يُنفَّذ شيء."
+
+        report = f"المصدر: `{source}`\n{reason}\nالمبلغ: `{amount:,.0f}$`"
+        result = await execute_signal_action(action, amount or 0, report, notify_chat_id, context)
+        return f"✅ تم التنفيذ\n{report}\n\n{result}"
+    finally:
+        db.close()
 
 
 # ==================== HANDLERS ====================
@@ -642,6 +773,117 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # ---- Signals menu ----
+        if data == "signals":
+            s = get_signal_settings(db, user_id)
+            bots = list_signal_bots(db, user_id)
+            last = ""
+            if s.last_signal_at:
+                last = f"\nآخر إشارة: `{s.last_signal_action}` — {s.last_signal_at.strftime('%Y-%m-%d %H:%M')}"
+            msg = (
+                f"*إدارة الإشارات*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"الحالة: {'🟢 مفعّل' if s.enabled else '🔴 متوقف'}\n"
+                f"حد البيع: `{s.sell_threshold_m}M USDT`\n"
+                f"حد الشراء: `{s.buy_threshold_m}M USDT`\n"
+                f"بوتات مسجّلة: `{len(bots)}`"
+                f"{last}\n\n"
+                f"• إرسال ≥ الحد → *بيع كل المحافظ الشغالة*\n"
+                f"• سحب ≥ الحد → *تشغيل/شراء كل المحافظ*"
+            )
+            await query.edit_message_text(msg, reply_markup=kb_signals(s.enabled), parse_mode="Markdown")
+            return
+
+        if data == "sig_toggle":
+            s = get_signal_settings(db, user_id)
+            s.enabled = not s.enabled
+            db.commit()
+            await query.edit_message_text(
+                f"{'🟢 تم تفعيل' if s.enabled else '🔴 تم إيقاف'} نظام الإشارات.",
+                reply_markup=kb_signals(s.enabled),
+                parse_mode="Markdown"
+            )
+            return
+
+        if data == "sig_bots":
+            bots = list_signal_bots(db, user_id)
+            lines = ["*بوتات الإشارات*\n━━━━━━━━━━━━━━━━━━━━\n"]
+            if not bots:
+                lines.append("لا يوجد بوتات بعد. أضف بوت إشارة.")
+            else:
+                for b in bots:
+                    st = "🟢" if b.enabled else "🔴"
+                    un = f"@{b.bot_username}" if b.bot_username else ""
+                    bid = f"id:`{b.bot_id}`" if b.bot_id else ""
+                    lines.append(f"{st} {b.label or ''} {un} {bid}".strip())
+            await query.edit_message_text("\n".join(lines), reply_markup=kb_sig_bots(), parse_mode="Markdown")
+            return
+
+        if data == "sig_bot_add":
+            context.user_data["waiting_signal"] = "add_bot"
+            await query.edit_message_text(
+                "*إضافة بوت إشارة*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                "أرسل واحداً من:\n"
+                "• يوزر البوت مثل `ArkhamAlerterBot`\n"
+                "• أو الايدي الرقمي مثل `123456789`\n\n"
+                "للإلغاء: /cancel",
+                parse_mode="Markdown"
+            )
+            return WAIT_SIGNAL_BOT
+
+        if data == "sig_bot_del_menu":
+            bots = list_signal_bots(db, user_id)
+            if not bots:
+                await query.edit_message_text("لا يوجد بوتات.", reply_markup=kb_sig_bots(), parse_mode="Markdown")
+                return
+            rows = [[InlineKeyboardButton(f"🗑️ {b.label or b.bot_username or b.bot_id}", callback_data=f"sig_del_{b.id}")] for b in bots]
+            rows.append([InlineKeyboardButton("◀️ رجوع", callback_data="sig_bots")])
+            await query.edit_message_text("اختر بوت للحذف:", reply_markup=InlineKeyboardMarkup(rows))
+            return
+
+        if data.startswith("sig_del_"):
+            rid = int(data.split("_")[2])
+            remove_signal_bot(db, user_id, rid)
+            await query.edit_message_text("✅ تم الحذف.", reply_markup=kb_sig_bots(), parse_mode="Markdown")
+            return
+
+        if data == "sig_rules":
+            s = get_signal_settings(db, user_id)
+            msg = (
+                f"*شروط الإشارة*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"حد البيع: `{s.sell_threshold_m}M`\n"
+                f"حد الشراء: `{s.buy_threshold_m}M`\n\n"
+                f"كلمات البيع:\n`{s.sell_keywords}`\n\n"
+                f"كلمات الشراء:\n`{s.buy_keywords}`"
+            )
+            await query.edit_message_text(msg, reply_markup=kb_sig_rules(), parse_mode="Markdown")
+            return
+
+        if data == "sig_set_thresh":
+            context.user_data["waiting_signal"] = "thresh"
+            await query.edit_message_text(
+                "*تعديل الحدود*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                "أرسل رقم الحد بالمليون (ينطبق على البيع والشراء).\n"
+                "مثال: `15`  يعني 15,000,000 USDT\n\n"
+                "للإلغاء: /cancel",
+                parse_mode="Markdown"
+            )
+            return WAIT_SIGNAL_THRESH
+
+        if data == "sig_test":
+            context.user_data["waiting_signal"] = "test"
+            await query.edit_message_text(
+                "*رسالة تجريبية*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                "اكتب رسالة كأنها من بوت الإشارة.\n\n"
+                "أمثلة:\n"
+                "`BlackRock sent 20M BTC to Coinbase`\n"
+                "`withdrew 18 million from exchange`\n\n"
+                "البوت سيحلّلها وينفّذ إن تحقّق الشرط.\n"
+                "للإلغاء: /cancel",
+                parse_mode="Markdown"
+            )
+            return WAIT_SIGNAL_TEST
+
     finally:
         db.close()
 
@@ -847,6 +1089,71 @@ async def wait_edit_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+
+async def wait_signal_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = (update.message.text or "").strip().lstrip("@")
+    if not raw:
+        await update.message.reply_text("أرسل يوزر أو آيدي صحيح أو /cancel")
+        return WAIT_SIGNAL_BOT
+    db = SessionLocal()
+    try:
+        bot_id = None
+        username = None
+        if raw.isdigit():
+            bot_id = int(raw)
+        else:
+            username = raw
+        row = add_signal_bot(db, update.effective_user.id, bot_username=username, bot_id=bot_id, label=raw)
+        await update.message.reply_text(
+            f"✅ تمت إضافة بوت الإشارة: `{raw}`",
+            reply_markup=kb_sig_bots(),
+            parse_mode="Markdown"
+        )
+    finally:
+        db.close()
+        context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def wait_signal_thresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = float((update.message.text or "").strip())
+        if val <= 0 or val > 10000:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("أدخل رقم موجب (مثلاً 15) أو /cancel")
+        return WAIT_SIGNAL_THRESH
+    db = SessionLocal()
+    try:
+        s = get_signal_settings(db, update.effective_user.id)
+        s.sell_threshold_m = val
+        s.buy_threshold_m = val
+        db.commit()
+        await update.message.reply_text(
+            f"✅ حد البيع والشراء = `{val}M USDT`",
+            reply_markup=kb_sig_rules(),
+            parse_mode="Markdown"
+        )
+    finally:
+        db.close()
+        context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def wait_signal_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    body = (update.message.text or "").strip()
+    if not body:
+        await update.message.reply_text("أرسل نص الرسالة التجريبية أو /cancel")
+        return WAIT_SIGNAL_TEST
+    result = await process_signal_text(
+        body, source="TEST", context=context,
+        notify_chat_id=update.effective_user.id, force_test=True
+    )
+    await update.message.reply_text(result, reply_markup=kb_signals(True), parse_mode="Markdown")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
 async def wait_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         val = float((update.message.text or "").strip())
@@ -868,6 +1175,53 @@ async def wait_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==================== MAIN ====================
+
+
+async def on_any_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Listen in groups for messages from registered signal bots (bot API)."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    user = msg.from_user
+    if not user:
+        return
+    # only groups/supergroups for auto signals (private uses test UI)
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup", "channel"):
+        return
+
+    db = SessionLocal()
+    try:
+        # match against any admin's signal bots — typically single ADMIN
+        admin = int(config.ADMIN_TELEGRAM_ID) if config.ADMIN_TELEGRAM_ID else None
+        if not admin:
+            return
+        bots = get_enabled_signal_bots(db, admin)
+        if not bots:
+            return
+        uid = user.id
+        uname = (user.username or "").lower()
+        matched = False
+        for b in bots:
+            if b.bot_id and int(b.bot_id) == uid:
+                matched = True
+                break
+            if b.bot_username and b.bot_username.lower() == uname:
+                matched = True
+                break
+        if not matched:
+            return
+        result = await process_signal_text(
+            msg.text, source=uname or str(uid), context=context,
+            notify_chat_id=admin, force_test=False
+        )
+        try:
+            await context.bot.send_message(chat_id=admin, text=result, parse_mode="Markdown")
+        except Exception:
+            pass
+    finally:
+        db.close()
+
 
 def main():
     if not config.TELEGRAM_BOT_TOKEN:
@@ -917,6 +1271,18 @@ def main():
                 MessageHandler(text_filters, wait_edit_alloc),
                 cb,
             ],
+            WAIT_SIGNAL_BOT: [
+                MessageHandler(text_filters, wait_signal_bot),
+                cb,
+            ],
+            WAIT_SIGNAL_THRESH: [
+                MessageHandler(text_filters, wait_signal_thresh),
+                cb,
+            ],
+            WAIT_SIGNAL_TEST: [
+                MessageHandler(text_filters, wait_signal_test),
+                cb,
+            ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel), CommandHandler("start", cmd_start)],
         per_message=False,
@@ -926,6 +1292,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(conv)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_any_text_message))
 
     logger.info("Starting Telegram bot (polling)...")
     app.run_polling(drop_pending_updates=True)

@@ -73,6 +73,40 @@ class RebalanceLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class SignalBot(Base):
+    """بوتات الإشارات المسموح قراءة رسائلها"""
+    __tablename__ = "signal_bots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(BigInteger, index=True, nullable=False)  # owner admin
+    bot_id = Column(BigInteger, nullable=True)  # telegram user id of signal bot (optional)
+    bot_username = Column(String(100), nullable=True)  # without @
+    label = Column(String(100), default="")
+    enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SignalSettings(Base):
+    """شروط تنفيذ إشارات البيع/الشراء"""
+    __tablename__ = "signal_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    enabled = Column(Boolean, default=True)
+    # threshold in USD millions (15 = 15,000,000 USD)
+    sell_threshold_m = Column(Float, default=15.0)
+    buy_threshold_m = Column(Float, default=15.0)
+    # keywords (comma-separated, lowercased matching)
+    sell_keywords = Column(Text, default="sent,send,transfer,to coinbase,to binance,to exchange,أرسل,تحويل,إلى")
+    buy_keywords = Column(Text, default="withdrew,withdraw,from coinbase,from binance,from exchange,empty,سحب,من")
+    last_signal_at = Column(DateTime, nullable=True)
+    last_signal_action = Column(String(20), nullable=True)
+    last_signal_text = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 
@@ -209,3 +243,42 @@ def log_action(db, telegram_id: int, action: str, details: str, success: bool = 
     )
     db.add(log)
     db.commit()
+
+
+def get_signal_settings(db, telegram_id: int) -> SignalSettings:
+    s = db.query(SignalSettings).filter(SignalSettings.telegram_id == telegram_id).first()
+    if not s:
+        s = SignalSettings(telegram_id=telegram_id)
+        db.add(s)
+        db.commit()
+        db.refresh(s)
+    return s
+
+
+def list_signal_bots(db, telegram_id: int):
+    return db.query(SignalBot).filter(SignalBot.telegram_id == telegram_id).order_by(SignalBot.id.desc()).all()
+
+
+def add_signal_bot(db, telegram_id: int, bot_username: str = None, bot_id: int = None, label: str = "") -> SignalBot:
+    username = (bot_username or "").lstrip("@").strip() or None
+    row = SignalBot(
+        telegram_id=telegram_id,
+        bot_id=bot_id,
+        bot_username=username,
+        label=label or username or str(bot_id or ""),
+        enabled=True,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def remove_signal_bot(db, telegram_id: int, row_id: int) -> bool:
+    n = db.query(SignalBot).filter(SignalBot.telegram_id == telegram_id, SignalBot.id == row_id).delete()
+    db.commit()
+    return n > 0
+
+
+def get_enabled_signal_bots(db, telegram_id: int):
+    return db.query(SignalBot).filter(SignalBot.telegram_id == telegram_id, SignalBot.enabled == True).all()
