@@ -1099,13 +1099,42 @@ async def wait_signal_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bot_id = None
         username = None
-        if raw.isdigit():
+        # accept negative channel ids: -100xxxxxxxxxx
+        if raw.lstrip("-").isdigit():
             bot_id = int(raw)
+            # normalize short channel id 4464102286 -> -1004464102286
+            if bot_id > 0 and bot_id < 10**12:
+                # store both forms: user enters 4464102286 or -100...
+                pass
+            label = str(bot_id)
         else:
             username = raw
-        row = add_signal_bot(db, update.effective_user.id, bot_username=username, bot_id=bot_id, label=raw)
+            label = raw
+        row = add_signal_bot(
+            db, update.effective_user.id,
+            bot_username=username, bot_id=bot_id, label=label
+        )
+        # if positive-looking channel id, also store -100 form
+        if bot_id and bot_id > 0 and not str(bot_id).startswith("100"):
+            alt = int(f"-100{bot_id}")
+            add_signal_bot(
+                db, update.effective_user.id,
+                bot_username=None, bot_id=alt, label=str(alt)
+            )
+            extra = f"\n+ تم أيضاً تسجيل `{alt}` (صيغة قناة)"
+        elif bot_id and bot_id > 0 and str(bot_id).startswith("100"):
+            alt = -bot_id if bot_id > 0 else bot_id
+            # 1004464102286 -> -1004464102286
+            alt = -int(bot_id)
+            add_signal_bot(
+                db, update.effective_user.id,
+                bot_username=None, bot_id=alt, label=str(alt)
+            )
+            extra = f"\n+ تم أيضاً تسجيل `{alt}` (صيغة قناة)"
+        else:
+            extra = ""
         await update.message.reply_text(
-            f"✅ تمت إضافة بوت الإشارة: `{raw}`",
+            f"✅ تمت إضافة مصدر الإشارة: `{raw}`{extra}",
             reply_markup=kb_sig_bots(),
             parse_mode="Markdown"
         )
@@ -1221,9 +1250,22 @@ async def on_any_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if getattr(chat, "username", None):
             candidates_names.add(chat.username.lower())
 
+        # Expand common Telegram channel id forms
+        expanded = set(candidates_ids)
+        for cid in list(candidates_ids):
+            expanded.add(cid)
+            expanded.add(abs(cid))
+            s = str(abs(cid))
+            if s.startswith("100") and len(s) > 3:
+                expanded.add(int(s[3:]))  # 100446... -> 446...
+                expanded.add(-int(s))     # -100446...
+            else:
+                expanded.add(int(f"-100{abs(cid)}"))
+        candidates_ids = expanded
+
         matched = False
         for b in bots:
-            if b.bot_id and int(b.bot_id) in candidates_ids:
+            if b.bot_id is not None and int(b.bot_id) in candidates_ids:
                 matched = True
                 source_label = b.label or str(b.bot_id)
                 break
@@ -1231,6 +1273,12 @@ async def on_any_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 matched = True
                 source_label = b.bot_username
                 break
+            # username field may hold numeric id string from old bug
+            if b.bot_username and b.bot_username.lstrip("-").isdigit():
+                if int(b.bot_username) in candidates_ids:
+                    matched = True
+                    source_label = b.bot_username
+                    break
         if not matched:
             logger.info(
                 "signal ignored (no source match) chat=%s ids=%s names=%s",
