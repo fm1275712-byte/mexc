@@ -269,30 +269,75 @@ def txt_balance(data: dict) -> str:
 
 # ==================== SIGNAL EXECUTION ====================
 
-async def execute_signal_action(action: str, amount: float, reason: str, notify_chat_id: int, context) -> str:
-    """Sell all running portfolios OR start all stopped portfolios."""
+# Holds the running Application so Telethon can notify the admin
+_app = None  # type: ignore
+
+
+def _get_signal_sources():
+    """Return (set of bot/channel ids, set of usernames) from DB for the admin."""
+    admin = int(config.ADMIN_TELEGRAM_ID) if config.ADMIN_TELEGRAM_ID else 0
+    if not admin:
+        return set(), set()
+    db = SessionLocal()
+    try:
+        bots = get_enabled_signal_bots(db, admin)
+        ids = set()
+        names = set()
+        for b in bots:
+            if b.bot_id is not None:
+                ids.add(int(b.bot_id))
+            if b.bot_username:
+                raw = b.bot_username.strip().lstrip("@")
+                if raw.lstrip("-").isdigit():
+                    ids.add(int(raw))
+                else:
+                    names.add(raw.lower())
+        return ids, names
+    finally:
+        db.close()
+
+
+async def execute_signal_action(action: str, amount: float, reason: str, notify_chat_id: int, bot=None) -> str:
+    """Sell all running portfolios OR start all stopped portfolios that have coins."""
     db = SessionLocal()
     lines = [f"📡 *تنفيذ إشارة*", f"السبب: {reason}", ""]
     try:
-        pfs = get_portfolios(db, int(config.ADMIN_TELEGRAM_ID or notify_chat_id), status="active")
+        admin_id = int(config.ADMIN_TELEGRAM_ID or notify_chat_id)
+        pfs = get_portfolios(db, admin_id, status="active")
         if not pfs:
             return "لا توجد محافظ نشطة لتنفيذ الإشارة."
 
         if action == "sell":
             lines.append("🔴 *بيع فوري — كل المحافظ الشغالة*")
+            any_sold = False
             for p in pfs:
                 if not p.is_running:
                     lines.append(f"• {p.name}: متوقفة (تخطي)")
                     continue
                 coins = [c.symbol for c in p.coins]
-                result = get_rebalancer().stop_portfolio(coins, dry_run=False)
-                set_portfolio_running(db, p.id, False)
-                sold = result.get("total_sold_usdt", 0)
-                lines.append(f"• {p.name}: بيع ≈ `{sold:.2f}$`")
-                log_action(db, p.telegram_id, "signal_sell", reason, True, p.id)
+                if not coins:
+                    lines.append(f"• {p.name}: بدون عملات (تخطي)")
+                    set_portfolio_running(db, p.id, False)
+                    continue
+                try:
+                    result = get_rebalancer().stop_portfolio(coins, dry_run=False)
+                    set_portfolio_running(db, p.id, False)
+                    sold = result.get("total_sold_usdt", 0)
+                    errs = result.get("errors") or []
+                    lines.append(f"• {p.name}: بيع ≈ `{sold:.2f}$`")
+                    if errs:
+                        lines.append(f"  ⚠️ {errs[0]}")
+                    any_sold = True
+                    log_action(db, p.telegram_id, "signal_sell", reason, True, p.id)
+                except Exception as e:
+                    lines.append(f"• {p.name}: خطأ `{e}`")
+                    log_action(db, p.telegram_id, "signal_sell", str(e), False, p.id)
+            if not any_sold:
+                lines.append("_لا توجد محافظ شغالة للبيع._")
 
         elif action == "buy":
-            lines.append("🟢 *شراء فوري — تشغيل كل المحافظ*")
+            lines.append("🟢 *شراء فوري — تشغيل كل المحافظ المتوقفة*")
+            any_bought = False
             for p in pfs:
                 coins = [c.symbol for c in p.coins]
                 if not coins:
@@ -301,22 +346,30 @@ async def execute_signal_action(action: str, amount: float, reason: str, notify_
                 if p.is_running:
                     lines.append(f"• {p.name}: تعمل بالفعل (تخطي)")
                     continue
-                result = get_rebalancer().start_portfolio(
-                    coins=coins, total_usdt=p.investment_usdt,
-                    method=p.allocation_method, min_trade_usdt=5.0, dry_run=False
-                )
-                if result.get("executed"):
-                    set_portfolio_running(db, p.id, True)
-                    lines.append(f"• {p.name}: تشغيل بمخصص `{p.investment_usdt:.0f}$`")
-                else:
-                    err = result.get("errors") or ["فشل"]
-                    lines.append(f"• {p.name}: خطأ {err[0]}")
-                log_action(db, p.telegram_id, "signal_buy", reason, bool(result.get("executed")), p.id)
+                if not p.investment_usdt or p.investment_usdt <= 0:
+                    lines.append(f"• {p.name}: مخصص = 0 (تخطي)")
+                    continue
+                try:
+                    result = get_rebalancer().start_portfolio(
+                        coins=coins, total_usdt=p.investment_usdt,
+                        method=p.allocation_method, min_trade_usdt=5.0, dry_run=False
+                    )
+                    if result.get("executed"):
+                        set_portfolio_running(db, p.id, True)
+                        lines.append(f"• {p.name}: تشغيل بمخصص `{p.investment_usdt:.0f}$`")
+                        any_bought = True
+                    else:
+                        err = result.get("errors") or ["فشل الشراء"]
+                        lines.append(f"• {p.name}: خطأ {err[0]}")
+                    log_action(db, p.telegram_id, "signal_buy", reason, bool(result.get("executed")), p.id)
+                except Exception as e:
+                    lines.append(f"• {p.name}: خطأ `{e}`")
+                    log_action(db, p.telegram_id, "signal_buy", str(e), False, p.id)
+            if not any_bought:
+                lines.append("_لا توجد محافظ متوقفة جاهزة للشراء (محتاجة عملات + مخصص + متوقفة)._")
         else:
             return "إجراء غير معروف"
 
-        # save last signal
-        admin_id = int(config.ADMIN_TELEGRAM_ID or notify_chat_id)
         s = get_signal_settings(db, admin_id)
         from datetime import datetime as dt
         s.last_signal_at = dt.utcnow()
@@ -327,14 +380,26 @@ async def execute_signal_action(action: str, amount: float, reason: str, notify_
         db.close()
 
     msg = "\n".join(lines)
-    try:
-        await context.bot.send_message(chat_id=notify_chat_id, text=msg, parse_mode="Markdown")
-    except Exception:
-        pass
+    if bot is not None:
+        try:
+            await bot.send_message(chat_id=notify_chat_id, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("notify admin after signal failed: %s", e)
     return msg
 
 
-async def process_signal_text(text: str, source: str, context, notify_chat_id: int, force_test: bool = False) -> str:
+async def process_signal_text(
+    text: str,
+    source: str,
+    notify_chat_id: int,
+    bot=None,
+    force_test: bool = False,
+    context=None,
+) -> str:
+    """Parse signal text and execute buy/sell on portfolios if conditions match."""
+    # backward-compat: old callers passed context as 3rd positional after source
+    if bot is None and context is not None:
+        bot = getattr(context, "bot", None)
     db = SessionLocal()
     try:
         admin_id = int(config.ADMIN_TELEGRAM_ID or notify_chat_id)
@@ -351,10 +416,12 @@ async def process_signal_text(text: str, source: str, context, notify_chat_id: i
         )
         report = f"المصدر: `{source}`\n{reason}"
         if action is None:
+            logger.info("signal not executed | source=%s | reason=%s", source, reason)
             return f"🧪 تحليل الإشارة\n{report}\n\n❌ لم يُنفَّذ شيء."
 
         report = f"المصدر: `{source}`\n{reason}\nالمبلغ: `{amount:,.0f}$`"
-        result = await execute_signal_action(action, amount or 0, report, notify_chat_id, context)
+        logger.info("signal EXECUTE | source=%s | action=%s | amount=%s", source, action, amount)
+        result = await execute_signal_action(action, amount or 0, report, notify_chat_id, bot=bot)
         return f"✅ تم التنفيذ\n{report}\n\n{result}"
     finally:
         db.close()
@@ -780,16 +847,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last = ""
             if s.last_signal_at:
                 last = f"\nآخر إشارة: `{s.last_signal_action}` — {s.last_signal_at.strftime('%Y-%m-%d %H:%M')}"
+            tel_ok = signal_listener.telethon_configured()
+            tel_status = "🟢 Telethon جاهز" if tel_ok else "⚪ Telethon غير مضبوط (Bot API فقط)"
             msg = (
                 f"*إدارة الإشارات*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"الحالة: {'🟢 مفعّل' if s.enabled else '🔴 متوقف'}\n"
+                f"القراءة: {tel_status}\n"
                 f"حد البيع: `{s.sell_threshold_m}M USDT`\n"
                 f"حد الشراء: `{s.buy_threshold_m}M USDT`\n"
                 f"بوتات مسجّلة: `{len(bots)}`"
                 f"{last}\n\n"
-                f"• إرسال ≥ الحد → *بيع كل المحافظ الشغالة*\n"
-                f"• سحب ≥ الحد → *تشغيل/شراء كل المحافظ*"
+                f"• إرسال/تحويل ≥ الحد → *بيع كل المحافظ الشغالة*\n"
+                f"• سحب ≥ الحد → *تشغيل/شراء المحافظ المتوقفة*\n"
+                f"  (يتخطى المحفظة لو مفيش عملات أو شغالة أصلاً)"
             )
             await query.edit_message_text(msg, reply_markup=kb_signals(s.enabled), parse_mode="Markdown")
             return
@@ -1175,8 +1246,10 @@ async def wait_signal_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("أرسل نص الرسالة التجريبية أو /cancel")
         return WAIT_SIGNAL_TEST
     result = await process_signal_text(
-        body, source="TEST", context=context,
-        notify_chat_id=update.effective_user.id, force_test=True
+        body, source="TEST",
+        notify_chat_id=update.effective_user.id,
+        bot=context.bot,
+        force_test=True,
     )
     await update.message.reply_text(result, reply_markup=kb_signals(True), parse_mode="Markdown")
     context.user_data.clear()
@@ -1287,8 +1360,10 @@ async def on_any_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         result = await process_signal_text(
-            msg.text, source=str(source_label), context=context,
-            notify_chat_id=admin, force_test=False
+            msg.text, source=str(source_label),
+            notify_chat_id=admin,
+            bot=context.bot,
+            force_test=False,
         )
         try:
             await context.bot.send_message(chat_id=admin, text=result, parse_mode="Markdown")
@@ -1299,6 +1374,7 @@ async def on_any_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 def main():
+    global _app
     if not config.TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN is required")
     if not config.MEXC_API_KEY or not config.MEXC_API_SECRET:
@@ -1309,7 +1385,80 @@ def main():
     init_db()
     logger.info("Database initialized")
 
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    async def post_init(application: Application):
+        """Start Telethon reader after PTB is ready."""
+        admin = int(config.ADMIN_TELEGRAM_ID) if config.ADMIN_TELEGRAM_ID else 0
+        if not admin:
+            logger.warning("ADMIN_TELEGRAM_ID not set — signal notifications may fail")
+
+        if not signal_listener.telethon_configured():
+            logger.info(
+                "Telethon disabled (no TELEGRAM_API_ID/HASH/SESSION). "
+                "Signals only via Bot API in shared groups/channels."
+            )
+            return
+
+        import asyncio as _aio
+
+        async def on_telethon_signal(text: str, source: str):
+            # runs on Telethon's event loop — schedule work on PTB loop
+            bot = application.bot
+            notify_id = admin or 0
+
+            async def _do():
+                try:
+                    result = await process_signal_text(
+                        text, source=source,
+                        notify_chat_id=notify_id,
+                        bot=bot,
+                        force_test=False,
+                    )
+                    # also send the analysis result if nothing was executed
+                    if result and "لم يُنفَّذ" in result and notify_id:
+                        try:
+                            await bot.send_message(
+                                chat_id=notify_id, text=result, parse_mode="Markdown"
+                            )
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.exception("process telethon signal failed: %s", e)
+                    if notify_id:
+                        try:
+                            await bot.send_message(
+                                chat_id=notify_id,
+                                text=f"⚠️ خطأ معالجة إشارة من {source}: {e}",
+                            )
+                        except Exception:
+                            pass
+
+            try:
+                loop = getattr(application, "_loop", None) or _aio.get_event_loop()
+            except Exception:
+                loop = None
+            if loop and loop.is_running() and loop is not _aio.get_running_loop():
+                fut = _aio.run_coroutine_threadsafe(_do(), loop)
+                try:
+                    fut.result(timeout=120)
+                except Exception as e:
+                    logger.exception("telethon→ptb bridge error: %s", e)
+            else:
+                await _do()
+
+        signal_listener.start_listener_background(
+            get_allowed_ids=lambda: _get_signal_sources()[0],
+            get_allowed_usernames=lambda: _get_signal_sources()[1],
+            on_signal_text=on_telethon_signal,
+        )
+        logger.info("Telethon signal listener launched from post_init")
+
+    app = (
+        Application.builder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+    _app = app
 
     # Callbacks work inside every conversation state + as entry points
     cb = CallbackQueryHandler(button_handler)
