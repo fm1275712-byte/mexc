@@ -159,6 +159,100 @@ def detect_action(text: str, sell_keywords: str, buy_keywords: str) -> Optional[
     return None
 
 
+def parse_spot_trade_signal(text: str) -> Optional[dict]:
+    """
+    Parse Arabic/English spot trading signals like:
+      سبوت " spot " 🟢
+      W
+      الدخول من السعر الحالي  :  0.010
+      الهدف : 0.0177 ✅
+      الوقف : 0.00925 🛑
+      Swing
+
+    Returns dict with coin, action ('buy'|'sell'), entry, target, stop — or None.
+    """
+    if not text:
+        return None
+    t = text.strip()
+    low = t.lower()
+
+    # Must look like a spot signal
+    is_spot = bool(re.search(r"سبوت|spot", low))
+    if not is_spot:
+        return None
+
+    # Direction from emoji / keywords
+    action = None
+    if "🟢" in t or "green" in low or re.search(r"شراء|buy\b|long", low):
+        action = "buy"
+    elif "🔴" in t or "red" in low or re.search(r"بيع|sell\b|short", low):
+        action = "sell"
+    if action is None:
+        # default green-style signals are buys when "سبوت" present without sell
+        if "🛑" in t and "هدف" in t:
+            action = "buy"
+        else:
+            return None
+
+    # Coin: prefer a short standalone token (2–10 chars, letters/numbers) on its own line
+    coin = None
+    for line in t.splitlines():
+        s = line.strip().strip('"“”\'`').upper()
+        if re.fullmatch(r"[A-Z0-9]{1,12}", s) and s not in ("SPOT", "SWING", "USDT", "USD"):
+            coin = s
+            break
+    if not coin:
+        # fallback: after سبوت/spot
+        m = re.search(r"(?:سبوت|spot)\s*[\"“”']?\s*([A-Za-z0-9]{1,12})", t, re.I)
+        if m:
+            coin = m.group(1).upper()
+    if not coin:
+        return None
+
+    def _num(pat: str) -> Optional[float]:
+        m = re.search(pat, t, re.I)
+        if not m:
+            return None
+        try:
+            return float(m.group(1).replace(",", ""))
+        except ValueError:
+            return None
+
+    entry = _num(r"(?:الدخول|entry|سعر\s*الحالي|current)\s*[^\d]*([\d.]+)")
+    # الهدف القديم من الرسالة (اختياري) — نستخدمه فقط لو مفيش entry
+    target_raw = _num(r"(?:الهدف|target|tp)\s*[^\d]*([\d.]+)")
+    stop = _num(r"(?:الوقف|stop|sl)\s*[^\d]*([\d.]+)")
+
+    # ثلاث أهداف ثابتة: كل هدف +5% من الدخول
+    # TP1 = +5% | TP2 = +10% | TP3 = +15%
+    targets = []
+    if entry is not None and entry > 0:
+        if action == "buy":
+            targets = [
+                round(entry * 1.05, 8),   # هدف 1: +5%
+                round(entry * 1.10, 8),   # هدف 2: +10%
+                round(entry * 1.15, 8),   # هدف 3: +15%
+            ]
+        else:  # sell / short
+            targets = [
+                round(entry * 0.95, 8),   # هدف 1: -5%
+                round(entry * 0.90, 8),   # هدف 2: -10%
+                round(entry * 0.85, 8),   # هدف 3: -15%
+            ]
+    elif target_raw is not None:
+        # fallback: هدف واحد من الرسالة لو مفيش سعر دخول
+        targets = [target_raw]
+
+    return {
+        "coin": coin,
+        "action": action,
+        "entry": entry,
+        "target": targets[0] if targets else target_raw,  # للتوافق مع الكود القديم
+        "targets": targets,  # الثلاث أهداف
+        "stop": stop,
+    }
+
+
 def evaluate_signal(
     text: str,
     sell_threshold_m: float,
@@ -169,7 +263,32 @@ def evaluate_signal(
     """
     Returns (action, amount_usd, reason).
     action: 'sell' | 'buy' | None
+
+    Supports:
+      1) Spot trade signals (سبوت / entry / target / stop) → buy/sell without $M threshold
+      2) Whale / Arkham transfer alerts with amount thresholds
     """
+    # --- 1) Spot trading signal format ---
+    spot = parse_spot_trade_signal(text)
+    if spot:
+        action = spot["action"]
+        coin = spot["coin"]
+        parts = [f"إشارة سبوت {action} | العملة `{coin}`"]
+        if spot.get("entry") is not None:
+            parts.append(f"دخول {spot['entry']}")
+        targets = spot.get("targets") or []
+        if len(targets) >= 3:
+            parts.append(f"أهداف: ①{targets[0]} (+5%) ②{targets[1]} (+10%) ③{targets[2]} (+15%)")
+        elif targets:
+            parts.append(f"هدف {targets[0]}")
+        elif spot.get("target") is not None:
+            parts.append(f"هدف {spot['target']}")
+        if spot.get("stop") is not None:
+            parts.append(f"وقف {spot['stop']}")
+        # amount=None is fine; caller treats spot signals specially or uses reason
+        return action, None, " | ".join(parts)
+
+    # --- 2) Whale / keyword signals ---
     amount = parse_amount_usd(text)
     action = detect_action(text, sell_keywords, buy_keywords)
 
@@ -209,6 +328,13 @@ To: Unknown Wallet
 Value: ($22,000,000.00)""",
         "BlackRock sent 20M BTC to Coinbase",
         "withdrew 18 million from exchange",
+        """سبوت “ spot “ 🟢
+
+ W
+الدخول من السعر الحالي  :  0.010
+الهدف : 0.0177 ✅
+الوقف : 0.00925 🛑
+Swing⏳🕔🔥""",
     ]
     for s in samples:
         print("---")

@@ -419,7 +419,10 @@ async def process_signal_text(
             logger.info("signal not executed | source=%s | reason=%s", source, reason)
             return f"🧪 تحليل الإشارة\n{report}\n\n❌ لم يُنفَّذ شيء."
 
-        report = f"المصدر: `{source}`\n{reason}\nالمبلغ: `{amount:,.0f}$`"
+        if amount is not None:
+            report = f"المصدر: `{source}`\n{reason}\nالمبلغ: `{amount:,.0f}$`"
+        else:
+            report = f"المصدر: `{source}`\n{reason}"
         logger.info("signal EXECUTE | source=%s | action=%s | amount=%s", source, action, amount)
         result = await execute_signal_action(action, amount or 0, report, notify_chat_id, bot=bot)
         return f"✅ تم التنفيذ\n{report}\n\n{result}"
@@ -795,13 +798,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parts = data.split("_")
             pf_id = int(parts[1])
             symbol = parts[2]
+            p = get_portfolio(db, pf_id, user_id)
+            sell_msg = ""
+            # بيع فوري بسعر السوق قبل الحذف (لو في رصيد)
+            try:
+                sell_result = get_rebalancer().stop_portfolio([symbol], dry_run=False)
+                sold = sell_result.get("total_sold_usdt", 0) or 0
+                if sell_result.get("executed"):
+                    sell_msg = f"\n🔴 تم بيع `{symbol}` فوراً ≈ `{sold:.2f}$`"
+                if sell_result.get("errors"):
+                    sell_msg += f"\n⚠️ {sell_result['errors'][0]}"
+            except Exception as e:
+                sell_msg = f"\n⚠️ فشل البيع: `{e}`"
             remove_coin_from_portfolio(db, pf_id, symbol)
             p = get_portfolio(db, pf_id, user_id)
             coins = [c.symbol for c in p.coins] if p else []
             targets = get_rebalancer().calculate_targets(coins, p.allocation_method) if p else {}
             current = get_mexc().get_coins_value(coins) if p else {"total_usdt": 0}
             await query.edit_message_text(
-                f"✅ تم حذف `{symbol}`\n\n" + (txt_portfolio(p, targets, current["total_usdt"]) if p else ""),
+                f"✅ تم حذف `{symbol}`{sell_msg}\n\n" + (txt_portfolio(p, targets, current["total_usdt"]) if p else ""),
                 reply_markup=kb_portfolio(pf_id, p.is_running if p else False),
                 parse_mode="Markdown"
             )
@@ -1055,12 +1070,30 @@ async def wait_add_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = get_or_create_user(db, update.effective_user.id)
         ok, msg = add_coin_to_portfolio(db, pf_id, sym, max_coins=user.max_coins_per_portfolio)
+        buy_msg = ""
         p = get_portfolio(db, pf_id, update.effective_user.id)
+        # لو المحفظة شغالة → اشتري حصة العملة الجديدة من رأس المال المخصص
+        if ok and p and p.is_running and p.investment_usdt > 0:
+            coins = [c.symbol for c in p.coins]
+            n = len(coins) or 1
+            usdt_for_new = p.investment_usdt / n
+            try:
+                result = get_rebalancer().start_portfolio(
+                    coins=[sym], total_usdt=usdt_for_new,
+                    method="equal", min_trade_usdt=5.0, dry_run=False
+                )
+                if result.get("executed"):
+                    bought = result["executed"][0].get("usdt", usdt_for_new)
+                    buy_msg = f"\n🟢 تم شراء `{sym}` ≈ `{bought:.2f}$` من رصيد المحفظة"
+                if result.get("errors"):
+                    buy_msg += f"\n⚠️ {result['errors'][0]}"
+            except Exception as e:
+                buy_msg = f"\n⚠️ فشل الشراء: `{e}`"
         coins = [c.symbol for c in p.coins] if p else []
         targets = get_rebalancer().calculate_targets(coins, p.allocation_method) if p else {}
         current = get_mexc().get_coins_value(coins) if p else {"total_usdt": 0}
         await update.message.reply_text(
-            msg + "\n\n" + (txt_portfolio(p, targets, current["total_usdt"]) if p else ""),
+            msg + buy_msg + "\n\n" + (txt_portfolio(p, targets, current["total_usdt"]) if p else ""),
             reply_markup=kb_portfolio(pf_id, p.is_running if p else False),
             parse_mode="Markdown"
         )
