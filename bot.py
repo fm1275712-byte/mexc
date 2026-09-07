@@ -1406,6 +1406,25 @@ async def on_any_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         db.close()
 
 
+def _start_dashboard_thread():
+    """تشغيل لوحة التحكم على PORT (Railway) في thread خلفي."""
+    import threading
+    import os
+
+    def _run():
+        try:
+            import uvicorn
+            port = int(os.getenv("PORT", os.getenv("DASHBOARD_PORT", "8080")))
+            logger.info("Dashboard starting on 0.0.0.0:%s", port)
+            uvicorn.run("dashboard:app", host="0.0.0.0", port=port, reload=False, log_level="info")
+        except Exception as e:
+            logger.exception("Dashboard failed to start: %s", e)
+
+    t = threading.Thread(target=_run, name="web-dashboard", daemon=True)
+    t.start()
+    logger.info("Web dashboard thread launched")
+
+
 def main():
     global _app
     if not config.TELEGRAM_BOT_TOKEN:
@@ -1417,6 +1436,9 @@ def main():
 
     init_db()
     logger.info("Database initialized")
+
+    # الداشبورد يشتغل حتى لو Start Command = python bot.py
+    _start_dashboard_thread()
 
     async def post_init(application: Application):
         """Start Telethon reader after PTB is ready."""
