@@ -1,7 +1,6 @@
 """
 MEXC Portfolio Manager — Web Dashboard
-لوحة تحكم ويب كاملة بنفس إمكانيات بوت التليجرام.
-تعمل جنباً إلى جنب مع البوت (نفس قاعدة البيانات و MEXC API).
+لوحة تحكم ويب لإدارة محافظ MEXC Spot (بدون تليجرام).
 """
 import os
 import secrets
@@ -27,8 +26,8 @@ from signal_parser import evaluate_signal
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
-DASHBOARD_SECRET = os.getenv("DASHBOARD_SECRET") or os.getenv("ADMIN_TELEGRAM_ID") or "change-me"
-ADMIN_ID = int(config.ADMIN_TELEGRAM_ID) if config.ADMIN_TELEGRAM_ID else 0
+DASHBOARD_SECRET = os.getenv("DASHBOARD_SECRET") or getattr(config, "DASHBOARD_SECRET", None) or "change-me"
+ADMIN_ID = int(getattr(config, "ADMIN_USER_ID", 1) or 1)
 
 app = FastAPI(title="MEXC Portfolio Dashboard", version="1.0")
 app.add_middleware(
@@ -171,7 +170,7 @@ def api_balance(_: bool = Depends(require_auth)):
 @app.get("/api/portfolios")
 def api_portfolios(_: bool = Depends(require_auth)):
     if not ADMIN_ID:
-        raise HTTPException(400, "ADMIN_TELEGRAM_ID غير مضبوط")
+        raise HTTPException(400, "ADMIN_USER_ID غير مضبوط")
     db = SessionLocal()
     try:
         get_or_create_user(db, ADMIN_ID)
