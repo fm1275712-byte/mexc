@@ -1,6 +1,24 @@
-# MEXC Portfolio Manager — Telegram Bot
+# MEXC Portfolio Manager — Telegram Bot + Web Dashboard
 
-بوت تليجرام لإدارة محافظ متعددة على منصة MEXC Spot مع تحكم كامل + نظام إشارات بيع/شراء تلقائي.
+بوت تليجرام + **لوحة تحكم ويب** لإدارة محافظ متعددة على منصة MEXC Spot مع تحكم كامل + نظام إشارات بيع/شراء تلقائي.
+
+## لوحة التحكم (Dashboard)
+
+نفس إمكانيات التليجرام من المتصفح: محافظ، تشغيل/إيقاف، إعادة توازن، إشارات، رصيد، إعدادات.
+
+```bash
+pip install -r requirements.txt
+# ضع DASHBOARD_SECRET في .env
+python run_dashboard.py
+# افتح http://localhost:8080 وأدخل المفتاح
+```
+
+| متغير | الوصف |
+|--------|--------|
+| `DASHBOARD_SECRET` | كلمة سر الدخول للداشبورد |
+| `DASHBOARD_PORT` / `PORT` | المنفذ (افتراضي 8080) |
+
+على Railway: خدمة للبوت `python bot.py` وخدمة للداشبورد `python run_dashboard.py` (نفس المتغيرات + DATABASE).
 
 ## المميزات
 

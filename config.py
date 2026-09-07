@@ -19,3 +19,7 @@ TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION")  # StringSession if already gen
 DEFAULT_THRESHOLD = 2.0
 DEFAULT_MIN_TRADE_USDT = 5.0
 QUOTE_ASSET = "USDT"
+
+# Web dashboard (alongside Telegram)
+DASHBOARD_SECRET = os.getenv("DASHBOARD_SECRET")  # password / API key for the dashboard
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", os.getenv("PORT", "8080")))
