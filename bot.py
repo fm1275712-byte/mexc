@@ -1406,27 +1406,38 @@ async def on_any_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         db.close()
 
 
-def _start_dashboard_thread():
-    """تشغيل لوحة التحكم على PORT (Railway) في thread خلفي."""
-    import threading
+def _start_dashboard_process():
+    """تشغيل لوحة التحكم على PORT في process منفصل (بدون تعارض event loop)."""
+    import multiprocessing
     import os
 
     def _run():
         try:
             import uvicorn
             port = int(os.getenv("PORT", os.getenv("DASHBOARD_PORT", "8080")))
-            logger.info("Dashboard starting on 0.0.0.0:%s", port)
-            uvicorn.run("dashboard:app", host="0.0.0.0", port=port, reload=False, log_level="info")
+            print(f"[dashboard] listening on 0.0.0.0:{port}", flush=True)
+            uvicorn.run(
+                "dashboard:app",
+                host="0.0.0.0",
+                port=port,
+                reload=False,
+                log_level="info",
+                loop="asyncio",
+            )
         except Exception as e:
-            logger.exception("Dashboard failed to start: %s", e)
+            print(f"[dashboard] failed: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
 
-    t = threading.Thread(target=_run, name="web-dashboard", daemon=True)
-    t.start()
-    logger.info("Web dashboard thread launched")
+    p = multiprocessing.Process(target=_run, name="web-dashboard", daemon=True)
+    p.start()
+    logger.info("Web dashboard process launched (pid=%s)", p.pid)
 
 
 def main():
     global _app
+    import asyncio
+
     if not config.TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN is required")
     if not config.MEXC_API_KEY or not config.MEXC_API_SECRET:
@@ -1438,7 +1449,13 @@ def main():
     logger.info("Database initialized")
 
     # الداشبورد يشتغل حتى لو Start Command = python bot.py
-    _start_dashboard_thread()
+    _start_dashboard_process()
+
+    # event loop للـ MainThread بعد أي imports
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     async def post_init(application: Application):
         """Start Telethon reader after PTB is ready."""
