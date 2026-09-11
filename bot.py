@@ -89,19 +89,19 @@ def pf_keyboard(pf_id: int, is_running: bool):
     rows = []
     if is_running:
         rows.append([InlineKeyboardButton("⏹ إيقاف", callback_data=f"stop_{pf_id}")])
-        rows.append([InlineKeyboardButton("📈 زيادة استثمار", callback_data=f"increase_{pf_id}")])
-        rows.append([
-            InlineKeyboardButton("🔄 معاينة إعادة توازن", callback_data=f"rebal_dry_{pf_id}"),
-            InlineKeyboardButton("✅ تنفيذ إعادة توازن", callback_data=f"rebal_run_{pf_id}"),
-        ])
     else:
         rows.append([InlineKeyboardButton("▶️ تشغيل", callback_data=f"start_{pf_id}")])
 
+    rows.append([InlineKeyboardButton("📈 زيادة استثمار", callback_data=f"increase_{pf_id}")])
+    rows.append([
+        InlineKeyboardButton("🔄 معاينة إعادة توازن", callback_data=f"rebal_dry_{pf_id}"),
+        InlineKeyboardButton("✅ تنفيذ إعادة توازن", callback_data=f"rebal_run_{pf_id}"),
+    ])
     rows.append([
         InlineKeyboardButton("➕ عملة", callback_data=f"addcoin_{pf_id}"),
         InlineKeyboardButton("➖ عملة", callback_data=f"removecoin_{pf_id}"),
     ])
-    rows.append([InlineKeyboardButton("🗑 إنهاء المحفظة", callback_data=f"close_{pf_id}")])
+    rows.append([InlineKeyboardButton("🗑 حذف المحفظة", callback_data=f"close_{pf_id}")])
     rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="list_pf")])
     return InlineKeyboardMarkup(rows)
 
@@ -297,9 +297,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pf_id = int(data.split("_")[1])
         context.user_data["confirm_close"] = pf_id
         await query.edit_message_text(
-            "⚠️ هل أنت متأكد من إنهاء المحفظة؟\n(سيتم بيع كل العملات إن كانت شغالة)",
+            "⚠️ هل أنت متأكد من حذف المحفظة؟\n(سيتم بيع كل العملات إن كانت شغالة)",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ نعم، أنهِ", callback_data=f"confirm_close_{pf_id}")],
+                [InlineKeyboardButton("✅ نعم، احذفها", callback_data=f"confirm_close_{pf_id}")],
                 [InlineKeyboardButton("❌ إلغاء", callback_data=f"view_{pf_id}")],
             ])
         )
