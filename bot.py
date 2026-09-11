@@ -1,6 +1,6 @@
 """
-MEXC Portfolio Manager — Telegram Bot only
-بوت تليجرام لإدارة محافظ متعددة على MEXC Spot (بدون داشبورد وبدون إشارات).
+    MEXC Portfolio Manager — Telegram Bot
+    بوت تليجرام لإدارة محافظ متعددة على MEXC Spot.
 """
 import logging
 from typing import Optional
@@ -663,7 +663,7 @@ def main():
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    logger.info("Bot starting (Telegram only, no signals, no dashboard)...")
+    logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

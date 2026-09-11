@@ -17,11 +17,9 @@ from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
     create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
     close_portfolio, set_portfolio_running, log_action,
-    get_signal_settings, list_signal_bots, add_signal_bot, remove_signal_bot,
 )
 from mexc_client import MexcClient
 from rebalancer import Rebalancer
-from signal_parser import evaluate_signal
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -87,21 +85,6 @@ class AmountIn(BaseModel):
 
 class AllocIn(BaseModel):
     investment_usdt: float = Field(ge=5)
-
-
-class SignalThreshIn(BaseModel):
-    sell_threshold_m: float = Field(gt=0)
-    buy_threshold_m: float = Field(gt=0)
-
-
-class SignalBotIn(BaseModel):
-    bot_username: Optional[str] = None
-    bot_id: Optional[int] = None
-    label: str = ""
-
-
-class SignalTestIn(BaseModel):
-    text: str
 
 
 class SettingsIn(BaseModel):
@@ -388,92 +371,6 @@ def api_close(pf_id: int, _: bool = Depends(require_auth)):
         db.close()
 
 
-# ---- Signals ----
-@app.get("/api/signals")
-def api_signals(_: bool = Depends(require_auth)):
-    db = SessionLocal()
-    try:
-        s = get_signal_settings(db, ADMIN_ID)
-        bots = list_signal_bots(db, ADMIN_ID)
-        return {
-            "enabled": s.enabled,
-            "sell_threshold_m": s.sell_threshold_m,
-            "buy_threshold_m": s.buy_threshold_m,
-            "sell_keywords": s.sell_keywords,
-            "buy_keywords": s.buy_keywords,
-            "last_signal_at": s.last_signal_at.isoformat() if s.last_signal_at else None,
-            "last_signal_action": s.last_signal_action,
-            "bots": [
-                {"id": b.id, "bot_id": b.bot_id, "bot_username": b.bot_username,
-                 "label": b.label, "enabled": b.enabled}
-                for b in bots
-            ],
-        }
-    finally:
-        db.close()
-
-
-@app.post("/api/signals/toggle")
-def api_sig_toggle(_: bool = Depends(require_auth)):
-    db = SessionLocal()
-    try:
-        s = get_signal_settings(db, ADMIN_ID)
-        s.enabled = not s.enabled
-        db.commit()
-        return {"enabled": s.enabled}
-    finally:
-        db.close()
-
-
-@app.post("/api/signals/thresholds")
-def api_sig_thresh(body: SignalThreshIn, _: bool = Depends(require_auth)):
-    db = SessionLocal()
-    try:
-        s = get_signal_settings(db, ADMIN_ID)
-        s.sell_threshold_m = body.sell_threshold_m
-        s.buy_threshold_m = body.buy_threshold_m
-        db.commit()
-        return {"ok": True, "sell_threshold_m": s.sell_threshold_m, "buy_threshold_m": s.buy_threshold_m}
-    finally:
-        db.close()
-
-
-@app.post("/api/signals/bots")
-def api_sig_bot_add(body: SignalBotIn, _: bool = Depends(require_auth)):
-    db = SessionLocal()
-    try:
-        row = add_signal_bot(db, ADMIN_ID, body.bot_username, body.bot_id, body.label)
-        return {"id": row.id, "bot_username": row.bot_username, "bot_id": row.bot_id, "label": row.label}
-    finally:
-        db.close()
-
-
-@app.delete("/api/signals/bots/{bot_row_id}")
-def api_sig_bot_del(bot_row_id: int, _: bool = Depends(require_auth)):
-    db = SessionLocal()
-    try:
-        ok = remove_signal_bot(db, ADMIN_ID, bot_row_id)
-        if not ok:
-            raise HTTPException(404, "غير موجود")
-        return {"ok": True}
-    finally:
-        db.close()
-
-
-@app.post("/api/signals/test")
-def api_sig_test(body: SignalTestIn, _: bool = Depends(require_auth)):
-    db = SessionLocal()
-    try:
-        s = get_signal_settings(db, ADMIN_ID)
-        action, amount, reason = evaluate_signal(
-            body.text, s.sell_threshold_m, s.buy_threshold_m,
-            s.sell_keywords, s.buy_keywords,
-        )
-        return {"action": action, "amount": amount, "reason": reason, "would_execute": action is not None}
-    finally:
-        db.close()
-
-
 @app.get("/api/settings")
 def api_settings(_: bool = Depends(require_auth)):
     db = SessionLocal()
@@ -650,7 +547,6 @@ pre.log {
     <nav class="tabs">
       <button class="active" data-tab="home" onclick="showTab('home')">الرئيسية</button>
       <button data-tab="portfolios" onclick="showTab('portfolios')">المحافظ</button>
-      <button data-tab="signals" onclick="showTab('signals')">الإشارات</button>
       <button data-tab="settings" onclick="showTab('settings')">الإعدادات</button>
     </nav>
     <button class="btn btn-ghost btn-sm" onclick="logout()">خروج</button>
@@ -678,39 +574,6 @@ pre.log {
       </div>
       <div id="pfList" class="grid grid-2"></div>
       <div id="pfDetail" class="card hidden" style="margin-top:1rem"></div>
-    </section>
-
-    <!-- SIGNALS -->
-    <section id="tab-signals" class="hidden">
-      <div class="card" style="margin-bottom:1rem">
-        <div class="row" style="justify-content:space-between">
-          <h3>نظام الإشارات</h3>
-          <button class="btn btn-sm" id="sigToggleBtn" onclick="toggleSignals()">—</button>
-        </div>
-        <div class="muted" id="sigMeta" style="margin-top:.5rem"></div>
-      </div>
-      <div class="grid grid-2">
-        <div class="card">
-          <h3>حدود المليون (M)</h3>
-          <div class="field"><label>حد البيع</label><input id="sellM" type="number" step="0.5"/></div>
-          <div class="field"><label>حد الشراء</label><input id="buyM" type="number" step="0.5"/></div>
-          <button class="btn btn-primary" onclick="saveThresh()">حفظ</button>
-        </div>
-        <div class="card">
-          <h3>بوتات / قنوات الإشارة</h3>
-          <div id="botList" class="muted" style="margin-bottom:.8rem"></div>
-          <div class="field"><input id="newBot" placeholder="@username أو آيدي"/></div>
-          <button class="btn btn-primary btn-sm" onclick="addBot()">إضافة</button>
-        </div>
-      </div>
-      <div class="card" style="margin-top:1rem">
-        <h3>🧪 اختبار رسالة إشارة</h3>
-        <textarea id="testText" rows="5" placeholder="الصق رسالة الإشارة هنا..."></textarea>
-        <div class="row" style="margin-top:.6rem">
-          <button class="btn btn-amber" onclick="testSignal()">تحليل</button>
-        </div>
-        <pre class="log" id="testOut" style="margin-top:.6rem"></pre>
-      </div>
     </section>
 
     <!-- SETTINGS -->
@@ -788,7 +651,6 @@ function showTab(name) {
   document.getElementById('tab-' + name).classList.remove('hidden');
   document.querySelectorAll('nav.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
   if (name === 'portfolios') loadPortfolios();
-  if (name === 'signals') loadSignals();
   if (name === 'settings') loadSettings();
   if (name === 'home') loadHome();
 }
@@ -937,56 +799,6 @@ async function createPf() {
     await api('/api/portfolios', {method:'POST', body: JSON.stringify({name, investment_usdt, coins})});
     document.getElementById('modal').classList.add('hidden');
     toast('تم الإنشاء'); loadPortfolios();
-  } catch(e){ toast(e.message); }
-}
-
-async function loadSignals() {
-  try {
-    const s = await api('/api/signals');
-    const btn = document.getElementById('sigToggleBtn');
-    btn.textContent = s.enabled ? '🟢 مفعّل — اضغط للإيقاف' : '🔴 متوقف — اضغط للتفعيل';
-    btn.className = 'btn btn-sm ' + (s.enabled ? 'btn-green' : 'btn-red');
-    document.getElementById('sigMeta').textContent =
-      (s.last_signal_at ? `آخر إشارة: ${s.last_signal_action} — ${s.last_signal_at}` : 'لا توجد إشارات بعد');
-    document.getElementById('sellM').value = s.sell_threshold_m;
-    document.getElementById('buyM').value = s.buy_threshold_m;
-    const bots = s.bots || [];
-    document.getElementById('botList').innerHTML = bots.length
-      ? bots.map(b => `<div class="row" style="justify-content:space-between;margin:.3rem 0">
-          <span>${b.label || b.bot_username || b.bot_id}</span>
-          <button class="btn btn-red btn-sm" onclick="delBot(${b.id})">حذف</button></div>`).join('')
-      : 'لا توجد بوتات';
-  } catch(e){ toast(e.message); }
-}
-async function toggleSignals() {
-  try { await api('/api/signals/toggle', {method:'POST'}); loadSignals(); } catch(e){ toast(e.message); }
-}
-async function saveThresh() {
-  try {
-    await api('/api/signals/thresholds', {method:'POST', body: JSON.stringify({
-      sell_threshold_m: parseFloat(document.getElementById('sellM').value),
-      buy_threshold_m: parseFloat(document.getElementById('buyM').value),
-    })});
-    toast('تم الحفظ');
-  } catch(e){ toast(e.message); }
-}
-async function addBot() {
-  const raw = document.getElementById('newBot').value.trim();
-  if (!raw) return;
-  const body = raw.lstrip ? {} : {};
-  if (/^-?\d+$/.test(raw)) body.bot_id = parseInt(raw);
-  else body.bot_username = raw.replace(/^@/, '');
-  try { await api('/api/signals/bots', {method:'POST', body: JSON.stringify(body)}); document.getElementById('newBot').value=''; loadSignals(); }
-  catch(e){ toast(e.message); }
-}
-async function delBot(id) {
-  try { await api('/api/signals/bots/'+id, {method:'DELETE'}); loadSignals(); } catch(e){ toast(e.message); }
-}
-async function testSignal() {
-  const text = document.getElementById('testText').value;
-  try {
-    const r = await api('/api/signals/test', {method:'POST', body: JSON.stringify({text})});
-    document.getElementById('testOut').textContent = JSON.stringify(r, null, 2);
   } catch(e){ toast(e.message); }
 }
 
