@@ -11,4 +11,4 @@ cmds = [
 ]
 
 [start]
-cmd = "python start.py"
+cmd = "python bot.py"
