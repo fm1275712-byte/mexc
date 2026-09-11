@@ -8,13 +8,11 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# هوية المستخدم في قاعدة البيانات (رقم ثابت — مش تليجرام)
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "1"))
+# Telegram
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# رقم الأدمن فقط يقدر يستخدم البوت (مستحسن جداً)
+ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0") or "0")
 
 DEFAULT_THRESHOLD = 2.0
 DEFAULT_MIN_TRADE_USDT = 5.0
 QUOTE_ASSET = "USDT"
-
-# Web dashboard
-DASHBOARD_SECRET = os.getenv("DASHBOARD_SECRET") or "change-me"
-DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", os.getenv("PORT", "8080")))

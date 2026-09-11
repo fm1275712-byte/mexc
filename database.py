@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, BigInteger, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, BigInteger, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
 import config
@@ -31,7 +31,7 @@ class Portfolio(Base):
     telegram_id = Column(BigInteger, index=True, nullable=False)
     name = Column(String(100), nullable=False)
     investment_usdt = Column(Float, default=0.0)
-    base_investment = Column(Float, default=0.0)  # amount kept after partial stop / original start
+    base_investment = Column(Float, default=0.0)
     status = Column(String(20), default="active")
     is_running = Column(Boolean, default=False)
 
@@ -56,6 +56,7 @@ class PortfolioCoin(Base):
     id = Column(Integer, primary_key=True, index=True)
     portfolio_id = Column(Integer, ForeignKey("portfolios.id"), nullable=False)
     symbol = Column(String(20), nullable=False)
+    target_percent = Column(Float, default=0.0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     portfolio = relationship("Portfolio", back_populates="coins")
@@ -65,46 +66,12 @@ class RebalanceLog(Base):
     __tablename__ = "rebalance_logs"
 
     id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(BigInteger, index=True)
+    telegram_id = Column(BigInteger, index=True, nullable=False)
     portfolio_id = Column(Integer, nullable=True)
-    action = Column(String(50))
-    details = Column(Text)
+    action = Column(String(50), nullable=False)
+    details = Column(String(500), nullable=True)
     success = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-
-
-class SignalBot(Base):
-    """بوتات الإشارات المسموح قراءة رسائلها"""
-    __tablename__ = "signal_bots"
-
-    id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(BigInteger, index=True, nullable=False)  # owner admin
-    bot_id = Column(BigInteger, nullable=True)  # telegram user id of signal bot (optional)
-    bot_username = Column(String(100), nullable=True)  # without @
-    label = Column(String(100), default="")
-    enabled = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-
-class SignalSettings(Base):
-    """شروط تنفيذ إشارات البيع/الشراء"""
-    __tablename__ = "signal_settings"
-
-    id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
-    enabled = Column(Boolean, default=True)
-    # threshold in USD millions (15 = 15,000,000 USD)
-    sell_threshold_m = Column(Float, default=15.0)
-    buy_threshold_m = Column(Float, default=15.0)
-    # keywords (comma-separated, lowercased matching)
-    sell_keywords = Column(Text, default="sent,send,transfer,to coinbase,to binance,to exchange,أرسل,تحويل,إلى")
-    buy_keywords = Column(Text, default="withdrew,withdraw,from coinbase,from binance,from exchange,empty,سحب,من")
-    last_signal_at = Column(DateTime, nullable=True)
-    last_signal_action = Column(String(20), nullable=True)
-    last_signal_text = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
 
 
 def init_db():
@@ -117,7 +84,6 @@ def init_db():
             if table not in insp.get_table_names():
                 continue
             cols = [c["name"] for c in insp.get_columns(table)]
-            # migrate discord_id -> telegram_id
             if "discord_id" in cols and "telegram_id" not in cols:
                 conn.execute(text(f'ALTER TABLE {table} RENAME COLUMN discord_id TO telegram_id'))
                 print(f"[migration] Renamed {table}.discord_id → telegram_id")
@@ -170,6 +136,7 @@ def create_portfolio(db, telegram_id: int, name: str, investment: float, coins: 
         telegram_id=telegram_id,
         name=name,
         investment_usdt=investment,
+        base_investment=investment,
         allocation_method=allocation_method,
         rebalance_mode=rebalance_mode,
         threshold=threshold,
@@ -179,22 +146,22 @@ def create_portfolio(db, telegram_id: int, name: str, investment: float, coins: 
     )
     db.add(p)
     db.flush()
-    for sym in coins:
-        db.add(PortfolioCoin(portfolio_id=p.id, symbol=sym.upper()))
+    for symbol in coins:
+        db.add(PortfolioCoin(portfolio_id=p.id, symbol=symbol.upper()))
     db.commit()
     db.refresh(p)
     return p
 
 
-def add_coin_to_portfolio(db, portfolio_id: int, symbol: str, max_coins: int = 10) -> tuple:
+def add_coin_to_portfolio(db, portfolio_id: int, symbol: str, max_coins: int = 10):
+    symbol = symbol.upper().strip()
     p = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
     if not p:
         return False, "المحفظة غير موجودة"
-    symbols = [c.symbol for c in p.coins]
-    symbol = symbol.upper()
-    if symbol in symbols:
-        return False, f"`{symbol}` موجودة بالفعل"
-    if len(symbols) >= max_coins:
+    existing = [c.symbol for c in p.coins]
+    if symbol in existing:
+        return False, f"`{symbol}` موجودة مسبقاً"
+    if len(existing) >= max_coins:
         return False, f"وصلت للحد الأقصى ({max_coins})"
     db.add(PortfolioCoin(portfolio_id=portfolio_id, symbol=symbol))
     db.commit()
@@ -243,42 +210,3 @@ def log_action(db, telegram_id: int, action: str, details: str, success: bool = 
     )
     db.add(log)
     db.commit()
-
-
-def get_signal_settings(db, telegram_id: int) -> SignalSettings:
-    s = db.query(SignalSettings).filter(SignalSettings.telegram_id == telegram_id).first()
-    if not s:
-        s = SignalSettings(telegram_id=telegram_id)
-        db.add(s)
-        db.commit()
-        db.refresh(s)
-    return s
-
-
-def list_signal_bots(db, telegram_id: int):
-    return db.query(SignalBot).filter(SignalBot.telegram_id == telegram_id).order_by(SignalBot.id.desc()).all()
-
-
-def add_signal_bot(db, telegram_id: int, bot_username: str = None, bot_id: int = None, label: str = "") -> SignalBot:
-    username = (bot_username or "").lstrip("@").strip() or None
-    row = SignalBot(
-        telegram_id=telegram_id,
-        bot_id=bot_id,
-        bot_username=username,
-        label=label or username or str(bot_id or ""),
-        enabled=True,
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
-
-
-def remove_signal_bot(db, telegram_id: int, row_id: int) -> bool:
-    n = db.query(SignalBot).filter(SignalBot.telegram_id == telegram_id, SignalBot.id == row_id).delete()
-    db.commit()
-    return n > 0
-
-
-def get_enabled_signal_bots(db, telegram_id: int):
-    return db.query(SignalBot).filter(SignalBot.telegram_id == telegram_id, SignalBot.enabled == True).all()
