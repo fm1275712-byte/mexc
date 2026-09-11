@@ -104,6 +104,12 @@ def init_db():
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN base_investment DOUBLE PRECISION DEFAULT 0"))
                 print("[migration] Added portfolios.base_investment")
 
+        if "portfolio_coins" in insp.get_table_names():
+            cols = [c["name"] for c in insp.get_columns("portfolio_coins")]
+            if "target_percent" not in cols:
+                conn.execute(text("ALTER TABLE portfolio_coins ADD COLUMN target_percent DOUBLE PRECISION DEFAULT 0"))
+                print("[migration] Added portfolio_coins.target_percent")
+
 
 def get_or_create_user(db, telegram_id: int):
     user = db.query(UserSettings).filter(UserSettings.telegram_id == telegram_id).first()
@@ -210,5 +216,4 @@ def log_action(db, telegram_id: int, action: str, details: str, success: bool = 
     )
     db.add(log)
     db.commit()
-
 
