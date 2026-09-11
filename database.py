@@ -74,6 +74,34 @@ class RebalanceLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class SignalSettings(Base):
+    __tablename__ = "signal_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    enabled = Column(Boolean, default=False)
+    sell_threshold_m = Column(Float, default=1.0)
+    buy_threshold_m = Column(Float, default=1.0)
+    sell_keywords = Column(String(2000), default="sell,transfer to exchange")
+    buy_keywords = Column(String(2000), default="buy,withdrawal from exchange")
+    last_signal_at = Column(DateTime, nullable=True)
+    last_signal_action = Column(String(20), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SignalBot(Base):
+    __tablename__ = "signal_bots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(BigInteger, index=True, nullable=False)
+    bot_username = Column(String(255), nullable=True)
+    bot_id = Column(BigInteger, nullable=True)
+    label = Column(String(255), default="")
+    enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 
@@ -210,3 +238,45 @@ def log_action(db, telegram_id: int, action: str, details: str, success: bool = 
     )
     db.add(log)
     db.commit()
+
+
+def get_signal_settings(db, telegram_id: int):
+    row = db.query(SignalSettings).filter(SignalSettings.telegram_id == telegram_id).first()
+    if not row:
+        row = SignalSettings(telegram_id=telegram_id)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+    return row
+
+
+def list_signal_bots(db, telegram_id: int):
+    return db.query(SignalBot).filter(
+        SignalBot.telegram_id == telegram_id
+    ).order_by(SignalBot.created_at.asc()).all()
+
+
+def add_signal_bot(db, telegram_id: int, bot_username: str = None,
+                   bot_id: int = None, label: str = ""):
+    row = SignalBot(
+        telegram_id=telegram_id,
+        bot_username=bot_username.lstrip("@").strip() if bot_username else None,
+        bot_id=bot_id,
+        label=label or "",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def remove_signal_bot(db, telegram_id: int, bot_row_id: int) -> bool:
+    row = db.query(SignalBot).filter(
+        SignalBot.id == bot_row_id,
+        SignalBot.telegram_id == telegram_id,
+    ).first()
+    if not row:
+        return False
+    db.delete(row)
+    db.commit()
+    return True
