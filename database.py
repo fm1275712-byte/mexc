@@ -324,10 +324,8 @@ def log_signal(db, telegram_id: int, action: str, reason: str = "", raw_text: st
 
 
 def parse_portfolio_ids(ids_str: str) -> list:
+    """يقبل: 21,22  أو  #21,#22  أو  21#,22#"""
     if not ids_str:
         return []
-    result = []
-    for part in ids_str.replace(" ", "").split(","):
-        if part.isdigit():
-            result.append(int(part))
-    return result
+    import re
+    return [int(x) for x in re.findall(r"\d+", ids_str)]

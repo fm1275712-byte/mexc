@@ -681,16 +681,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("editf_"):
-        # editf_min_usd_1  or editf_buy_pfs_1
         parts = data.split("_")
-        # editf, field..., src_id
         src_id = int(parts[-1])
-        field = "_".join(parts[1:-1])  # min_usd / max_tx / buy_pfs / sell_pfs / cooldown
+        field = "_".join(parts[1:-1])
         field_map = {
             "min_usd": ("min_usd", "أرسل الحد الأدنى بالدولار (مثال: 1000000):"),
             "max_tx": ("max_tx_count", "أرسل أقصى عدد تحويلات (مثال: 3):"),
-            "buy_pfs": ("buy_portfolio_ids", "أرسل أرقام محافظ الشراء مفصولة بفاصلة (مثال: 1,2)\nأو none:"),
-            "sell_pfs": ("sell_portfolio_ids", "أرسل أرقام محافظ البيع مفصولة بفاصلة (مثال: 1,2)\nأو none:"),
+            "buy_pfs": ("buy_portfolio_ids", "أرسل أرقام محافظ الشراء مفصولة بفاصلة (مثال: 21,22)\nأو none:"),
+            "sell_pfs": ("sell_portfolio_ids", "أرسل أرقام محافظ البيع مفصولة بفاصلة (مثال: 21,22)\nأو none:"),
             "cooldown": ("cooldown_minutes", "أرسل مدة التبريد بالدقائق (مثال: 30):"),
         }
         if field not in field_map:
@@ -700,7 +698,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["edit_src_id"] = src_id
         context.user_data["edit_src_field"] = db_field
         context.user_data["waiting"] = True
-        await query.edit_message_text(prompt)
+        await query.edit_message_text(
+            prompt,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ رجوع", callback_data=f"edit_src_{src_id}")]
+            ])
+        )
         return EDIT_SRC_VALUE
 
 
@@ -983,7 +986,12 @@ async def edit_src_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("حقل غير مدعوم.")
             return ConversationHandler.END
     except ValueError:
-        await update.message.reply_text("قيمة غير صحيحة، حاول مرة أخرى.")
+        await update.message.reply_text(
+            "قيمة غير صحيحة، حاول مرة أخرى.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ رجوع", callback_data=f"edit_src_{src_id}")]
+            ])
+        )
         return EDIT_SRC_VALUE
 
     db = SessionLocal()
@@ -994,7 +1002,11 @@ async def edit_src_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ تم التعديل\n\n{format_source(src)}",
                 parse_mode="Markdown",
-                reply_markup=main_menu_keyboard()
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✏️ تعديل تاني", callback_data=f"edit_src_{src_id}")],
+                    [InlineKeyboardButton("📡 المصادر", callback_data="list_sources")],
+                    [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
+                ])
             )
         else:
             await update.message.reply_text("المصدر غير موجود.", reply_markup=main_menu_keyboard())
