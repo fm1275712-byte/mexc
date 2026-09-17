@@ -156,19 +156,104 @@ def format_source(s) -> str:
 
 def parse_signal_message(text: str) -> Optional[Dict[str, Any]]:
     """
-    يدعم صيغتين:
-    1) المنظمة: #SIGNAL / إشارة + Source/Action/...
-    2) تنبيه Arkham: From: ... To: ... Value: ... ($X)
+    يدعم:
+    1) صيغة Whale Alert
+    2) صيغة Arkham (From: ... To: ...)
+    3) الصيغة المنظمة #SIGNAL / إشارة
     """
     if not text or len(text) < 8:
         return None
+
     text = text.strip()
     lower = text.lower()
-    result = {"source": None, "action": None, "reason": "", "portfolios": [], "size": "full", "raw": text[:1500], "usd_value": 0.0}
+    result = {
+        "source": None,
+        "action": None,
+        "reason": "",
+        "portfolios": [],
+        "size": "full",
+        "raw": text[:1500],
+        "usd_value": 0.0,
+        "symbol": None,
+    }
 
-    # ---------- صيغة Arkham ----------
-    # From: Coinbase ... To: BlackRock ...  => BUY
-    # From: BlackRock ... To: Coinbase ...  => SELL
+    # ========== 1) صيغة Whale Alert ==========
+    # مثال:
+    # 🚨🚨🚨 1,720 $BTC (131,865,141 USD) transferred from Coinbase Institutional to unknown new wallet
+    # 🚨🚨 828 $BTC (63,648,815 USD) transferred from unknown wallet to #Coinbase
+
+    whale_pattern = re.search(
+        r"(?:🚨\s*)*"                                    # الإيموجي
+        r"([\d,]+(?:\.\d+)?)\s*"                       # الكمية
+        r"\$?([A-Za-z0-9]+)\s*"                          # الرمز (BTC / ETH / XRP ...)
+        r"\(([\d,]+(?:\.\d+)?)\s*USD\)\s*"           # القيمة بالدولار
+        r"transferred from\s+(.+?)\s+to\s+(.+?)(?:\n|Details|$)",
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+
+    if whale_pattern:
+        amount_str = whale_pattern.group(1).replace(",", "")
+        symbol = whale_pattern.group(2).upper().lstrip("$")
+        usd_str = whale_pattern.group(3).replace(",", "")
+        from_entity = whale_pattern.group(4).strip()
+        to_entity = whale_pattern.group(5).strip()
+
+        try:
+            result["usd_value"] = float(usd_str)
+        except Exception:
+            result["usd_value"] = 0.0
+
+        result["symbol"] = symbol
+        result["source"] = "WhaleAlert"
+        result["reason"] = f"{amount_str} {symbol} | {from_entity} → {to_entity}"
+
+        from_l = from_entity.lower()
+        to_l = to_entity.lower()
+
+        # قائمة المنصات المعروفة
+        exchanges = [
+            "coinbase", "kraken", "binance", "uphold", "revolut", "falconx",
+            "bitfinex", "okx", "okex", "bybit", "huobi", "htx", "gemini",
+            "bitstamp", "zero hash", "zerohash", "bitgo", "cumberland",
+            "jump", "wintermute", "b2c2", "galaxy", "robinhood", "crypto.com",
+            "kucoin", "mexc", "gate.io", "gateio", "bitget"
+        ]
+
+        def is_exchange(s: str) -> bool:
+            return any(ex in s for ex in exchanges)
+
+        def is_unknown(s: str) -> bool:
+            return "unknown" in s or "new wallet" in s
+
+        # قائمة العملات المستقرة
+        stables = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "USDD", "BUSD", "PYUSD"}
+        is_stable = symbol in stables
+
+        # --- قواعد القرار ---
+        if is_exchange(from_l) and is_unknown(to_l):
+            # سحب من منصة → محفظة غير معروفة
+            if is_stable:
+                result["action"] = "SELL"      # سحب فلوس = غالباً سلبي
+            else:
+                result["action"] = "BUY"       # سحب BTC/ETH = تجميع
+        elif is_unknown(from_l) and is_exchange(to_l):
+            # إيداع في منصة
+            if is_stable:
+                result["action"] = "BUY"       # إيداع فلوس = استعداد للشراء (إيجابي)
+            else:
+                result["action"] = "SELL"      # إيداع BTC/ETH = استعداد للبيع
+        elif is_exchange(from_l) and is_exchange(to_l):
+            # تحويل بين منصات → نتجاهل
+            return None
+        else:
+            # تحويلات أخرى ضعيفة الإشارة
+            return None
+
+        if result["action"]:
+            return result
+
+    # ========== 2) صيغة Arkham ==========
     from_m = re.search(r"From\s*:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
     to_m = re.search(r"To\s*:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
     if from_m and to_m:
@@ -188,15 +273,12 @@ def parse_signal_message(text: str) -> Optional[Dict[str, Any]]:
             result["source"] = "BlackRock"
             result["reason"] = f"Deposit to Coinbase from BlackRock | {to_m.group(1).strip()[:80]}"
 
-        # استخراج القيمة بالدولار
-        # Value: 113.227030 BTC ($8,681,003.18)  أو  ($8.6M)
         usd_m = re.search(r"\(\$([0-9,]+(?:\.[0-9]+)?)\s*([KMB])?\)", text, re.IGNORECASE)
         if usd_m:
             num = float(usd_m.group(1).replace(",", ""))
             mult = {"K": 1e3, "M": 1e6, "B": 1e9}.get((usd_m.group(2) or "").upper(), 1)
             result["usd_value"] = num * mult
         else:
-            # Value: $8,681,003.18
             usd_m2 = re.search(r"Value\s*:.*?\$([0-9,]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
             if usd_m2:
                 result["usd_value"] = float(usd_m2.group(1).replace(",", ""))
@@ -204,7 +286,7 @@ def parse_signal_message(text: str) -> Optional[Dict[str, Any]]:
         if result["action"]:
             return result
 
-    # ---------- الصيغة المنظمة ----------
+    # ========== 3) الصيغة المنظمة #SIGNAL ==========
     if not any(k in lower for k in ("#signal", "إشارة", "اشارة", "signal")):
         return None
 
@@ -227,6 +309,7 @@ def parse_signal_message(text: str) -> Optional[Dict[str, Any]]:
     m = re.search(r"(?:size|الحجم|حجم)\s*[:：]\s*(.+)", text, re.IGNORECASE)
     if m:
         result["size"] = m.group(1).strip().lower()
+
     if result["action"] and (result["source"] or result["portfolios"]):
         return result
     return None
@@ -274,15 +357,17 @@ async def execute_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, par
                     matched = s
                     break
 
-        # 2) لو رسالة Arkham (From/To) ومفيش مطابقة بالاسم:
-        #    فضّل مصدر اسمه فيه arkham أو blackrock، وإلا أول مصدر مفعل
-        is_arkham_msg = bool(parsed.get("usd_value")) or (
-            "from:" in (parsed.get("raw") or "").lower() and "to:" in (parsed.get("raw") or "").lower()
+        # 2) لو رسالة WhaleAlert أو Arkham ومفيش مطابقة بالاسم:
+        #    فضّل مصدر اسمه فيه whale أو arkham أو blackrock، وإلا أول مصدر مفعل
+        raw_lower = (parsed.get("raw") or "").lower()
+        is_auto_msg = bool(parsed.get("usd_value")) or (
+            ("from:" in raw_lower and "to:" in raw_lower) or
+            "transferred from" in raw_lower
         )
-        if not matched and is_arkham_msg and enabled_sources:
+        if not matched and is_auto_msg and enabled_sources:
             for s in enabled_sources:
                 n = s.name.lower()
-                if "arkham" in n or "blackrock" in n or "ibit" in n:
+                if "whale" in n or "arkham" in n or "blackrock" in n or "ibit" in n:
                     matched = s
                     break
             if not matched:
