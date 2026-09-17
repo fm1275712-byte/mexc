@@ -338,7 +338,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def execute_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: Dict):
-    tid = update.effective_user.id
+    tid = config.ADMIN_TELEGRAM_ID or (update.effective_user.id if update.effective_user else 0)
     db = SessionLocal()
     try:
         source_name = parsed.get("source")
@@ -557,11 +557,30 @@ async def execute_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, par
 async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    if not await ensure_admin(update):
-        return
+
+    text = update.message.text
+    # رسائل الإشارات (Whale Alert / #SIGNAL / Arkham) تُقبل حتى لو جاية من Forwarder
+    is_signal_like = (
+        "transferred from" in text.lower()
+        or "#signal" in text.lower()
+        or "إشارة" in text
+        or "اشارة" in text
+        or text.strip().lower().startswith("from:")
+    )
+
+    if not is_signal_like:
+        # رسائل عادية → لازم تكون من الأدمن
+        if not await ensure_admin(update):
+            return
+    else:
+        # رسائل إشارات → ننفذها باسم الأدمن
+        if not config.ADMIN_TELEGRAM_ID:
+            return
+
     if context.user_data.get("waiting"):
         return
-    parsed = parse_signal_message(update.message.text)
+
+    parsed = parse_signal_message(text)
     if parsed:
         await execute_signal(update, context, parsed)
 
