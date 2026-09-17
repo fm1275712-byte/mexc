@@ -323,8 +323,70 @@ async def execute_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, par
                        result_msg=f"تحت الحد: {usd_val} < {matched.min_usd}")
             return
 
-        # ----- cooldown بعد تنفيذ ناجح -----
-        if matched and matched.cooldown_minutes > 0:
+        # ----- تجميع التحويلات (بدون انتهاء زمني) -----
+        needed = matched.max_tx_count if matched and matched.max_tx_count > 0 else 1
+
+        if matched and needed > 1:
+            # كل الـ pending المفتوحة لنفس المصدر + القرار
+            old_pending = db.query(SignalLog).filter(
+                SignalLog.source_id == matched.id,
+                SignalLog.action == action,
+                SignalLog.executed == False,
+                SignalLog.result_msg.like("pending%")
+            ).all()
+
+            # مجموع المبالغ السابقة من result_msg: pending 1/2 | usd=123
+            prev_usd = 0.0
+            for op in old_pending:
+                m = re.search(r"usd=([0-9.]+)", op.result_msg or "")
+                if m:
+                    prev_usd += float(m.group(1))
+
+            current_count = len(old_pending) + 1
+            total_usd = prev_usd + (usd_val if usd_val > 0 else 0)
+
+            if current_count < needed:
+                log_signal(
+                    db, tid, action, reason, parsed.get("raw", ""),
+                    source_id=matched.id, executed=False,
+                    result_msg=f"pending {current_count}/{needed} | usd={usd_val or 0}"
+                )
+                remaining = needed - current_count
+
+                def fmt_m(v):
+                    if v >= 1_000_000:
+                        return f"${v/1_000_000:.2f}M"
+                    if v >= 1_000:
+                        return f"${v/1_000:.1f}K"
+                    return f"${v:,.0f}"
+
+                await update.message.reply_text(
+                    f"📥 *تحويل مستلم* ({current_count}/{needed})\n"
+                    f"المصدر: `{matched.name}`\n"
+                    f"القرار: *{action}*\n"
+                    f"السبب: {reason or '—'}\n\n"
+                    f"💵 آخر تحويل: *{fmt_m(usd_val)}*\n"
+                    f"💰 المجموع حتى الآن: *{fmt_m(total_usd)}*\n"
+                    f"🎯 الحد الأدنى للتحويل: *{fmt_m(matched.min_usd)}*\n\n"
+                    f"⏳ باقي *{remaining}* تحويل"
+                    f"{'ات' if remaining >= 3 else ('ان' if remaining == 2 else '')}"
+                    f" لتنفيذ الأمر.",
+                    parse_mode="Markdown"
+                )
+                return
+            else:
+                # وصلنا للعدد → صفّر الـ pending + اعرض المجموع
+                total_usd = prev_usd + (usd_val if usd_val > 0 else 0)
+                for op in old_pending:
+                    op.result_msg = f"consumed→exec {needed}"
+                db.commit()
+                # نخزن المجموع عشان يظهر في تقرير التنفيذ
+                parsed["usd_value"] = total_usd
+                parsed["reason"] = (reason or "") + f" | مجموع {needed} تحويلات ≈ ${total_usd:,.0f}"
+                reason = parsed["reason"]
+
+        # ----- cooldown بعد تنفيذ فقط (لو > 0) -----
+        if matched and matched.cooldown_minutes and matched.cooldown_minutes > 0:
             cutoff = datetime.utcnow() - timedelta(minutes=matched.cooldown_minutes)
             recent = db.query(SignalLog).filter(
                 SignalLog.source_id == matched.id,
@@ -333,64 +395,10 @@ async def execute_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, par
                 SignalLog.created_at >= cutoff
             ).first()
             if recent:
-                await update.message.reply_text(f"⏳ تم تجاهل الإشارة (cooldown {matched.cooldown_minutes} دقيقة بعد آخر تنفيذ).")
-                return
-
-        # ----- تجميع التحويلات (max_tx_count) -----
-        # نافذة التجميع = cooldown_minutes (أو 60 دقيقة افتراضي)
-        window_min = matched.cooldown_minutes if matched and matched.cooldown_minutes > 0 else 60
-        needed = matched.max_tx_count if matched and matched.max_tx_count > 0 else 1
-
-        if matched and needed > 1:
-            window_start = datetime.utcnow() - timedelta(minutes=window_min)
-            # التحويلات المعلقة (غير منفذة) في النافذة + الحالية
-            pending = db.query(SignalLog).filter(
-                SignalLog.source_id == matched.id,
-                SignalLog.action == action,
-                SignalLog.executed == False,
-                SignalLog.created_at >= window_start,
-                SignalLog.result_msg.like("pending%")  # علامة الانتظار
-            ).count()
-
-            current_count = pending + 1  # + الرسالة الحالية
-
-            if current_count < needed:
-                # سجّل كـ pending
-                log_signal(
-                    db, tid, action, reason, parsed.get("raw", ""),
-                    source_id=matched.id, executed=False,
-                    result_msg=f"pending {current_count}/{needed}"
-                )
-                remaining = needed - current_count
-                total_usd_approx = ""
-                if usd_val > 0:
-                    total_usd_approx = f"\nآخر تحويل: `${usd_val:,.0f}`"
                 await update.message.reply_text(
-                    f"📥 *تحويل مستلم* ({current_count}/{needed})\n"
-                    f"المصدر: `{matched.name}`\n"
-                    f"القرار: *{action}*\n"
-                    f"السبب: {reason or '—'}\n"
-                    f"{total_usd_approx}\n\n"
-                    f"⏳ باقي *{remaining}* تحويل"
-                    f"{'ات' if remaining >= 3 else ('ان' if remaining == 2 else '')}"
-                    f" خلال {window_min} دقيقة لتنفيذ الأمر.",
-                    parse_mode="Markdown"
+                    f"⏳ تم التنفيذ مؤخراً — انتظر {matched.cooldown_minutes} دقيقة قبل تنفيذ جديد."
                 )
                 return
-            else:
-                # وصلنا للعدد المطلوب → نكمّل التنفيذ
-                # علّم الـ pending السابقة كـ consumed
-                window_start = datetime.utcnow() - timedelta(minutes=window_min)
-                old_pending = db.query(SignalLog).filter(
-                    SignalLog.source_id == matched.id,
-                    SignalLog.action == action,
-                    SignalLog.executed == False,
-                    SignalLog.created_at >= window_start,
-                    SignalLog.result_msg.like("pending%")
-                ).all()
-                for op in old_pending:
-                    op.result_msg = f"consumed→exec {needed}"
-                db.commit()
 
         if matched:
             if action == "BUY" and not matched.allow_buy:
