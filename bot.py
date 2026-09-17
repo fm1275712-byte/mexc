@@ -1,0 +1,1074 @@
+"""
+    MEXC Portfolio Manager + Signal Engine
+    بوت تليجرام لإدارة محافظ متعددة + نظام إشارات تنفيذ ذكي.
+"""
+import logging
+import re
+from typing import Optional, Dict, Any
+from datetime import datetime, timedelta
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+
+import config
+from database import (
+    init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
+    create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
+    close_portfolio, set_portfolio_running, log_action,
+    get_signal_sources, get_signal_source, create_signal_source,
+    update_signal_source, delete_signal_source, log_signal, parse_portfolio_ids,
+    SignalLog,
+)
+from mexc_client import MexcClient
+from rebalancer import Rebalancer
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+(
+    CREATE_NAME, CREATE_AMOUNT, CREATE_COINS, ADD_COIN, INCREASE_AMOUNT,
+    SRC_NAME, SRC_MIN_USD, SRC_MAX_TX, SRC_BUY_PFS, SRC_SELL_PFS,
+    EDIT_SRC_FIELD, EDIT_SRC_VALUE,
+) = range(12)
+
+_mexc: Optional[MexcClient] = None
+_reb: Optional[Rebalancer] = None
+
+
+def get_mexc() -> MexcClient:
+    global _mexc
+    if _mexc is None:
+        _mexc = MexcClient()
+    return _mexc
+
+
+def get_reb() -> Rebalancer:
+    global _reb
+    if _reb is None:
+        _reb = Rebalancer(get_mexc())
+    return _reb
+
+
+def is_admin(user_id: int) -> bool:
+    if not config.ADMIN_TELEGRAM_ID:
+        return True
+    return user_id == config.ADMIN_TELEGRAM_ID
+
+
+async def ensure_admin(update: Update) -> bool:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        msg = update.effective_message
+        if msg:
+            await msg.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
+        return False
+    return True
+
+
+def main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 محافظي", callback_data="list_pf")],
+        [InlineKeyboardButton("➕ محفظة جديدة", callback_data="create_pf")],
+        [InlineKeyboardButton("📡 مصادر الإشارات", callback_data="list_sources")],
+        [InlineKeyboardButton("💰 الرصيد", callback_data="balance")],
+        [InlineKeyboardButton("⚙️ إعدادات", callback_data="settings")],
+    ])
+
+
+def pf_keyboard(pf_id: int, is_running: bool):
+    rows = []
+    if is_running:
+        rows.append([InlineKeyboardButton("⏹ إيقاف", callback_data=f"stop_{pf_id}")])
+    else:
+        rows.append([InlineKeyboardButton("▶️ تشغيل", callback_data=f"start_{pf_id}")])
+    rows.append([InlineKeyboardButton("📈 زيادة استثمار", callback_data=f"increase_{pf_id}")])
+    rows.append([
+        InlineKeyboardButton("🔄 معاينة إعادة توازن", callback_data=f"rebal_dry_{pf_id}"),
+        InlineKeyboardButton("✅ تنفيذ إعادة توازن", callback_data=f"rebal_run_{pf_id}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("➕ عملة", callback_data=f"addcoin_{pf_id}"),
+        InlineKeyboardButton("➖ عملة", callback_data=f"removecoin_{pf_id}"),
+    ])
+    rows.append([InlineKeyboardButton("🗑 حذف المحفظة", callback_data=f"close_{pf_id}")])
+    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="list_pf")])
+    return InlineKeyboardMarkup(rows)
+
+
+def sources_keyboard(sources):
+    buttons = []
+    for s in sources:
+        icon = "🟢" if s.enabled else "🔴"
+        buttons.append([InlineKeyboardButton(f"{icon} {s.name}", callback_data=f"view_src_{s.id}")])
+    buttons.append([InlineKeyboardButton("➕ مصدر جديد", callback_data="create_src")])
+    buttons.append([InlineKeyboardButton("⬅️ القائمة", callback_data="menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def source_detail_keyboard(src_id: int, enabled: bool):
+    rows = []
+    if enabled:
+        rows.append([InlineKeyboardButton("⏹ تعطيل", callback_data=f"toggle_src_{src_id}")])
+    else:
+        rows.append([InlineKeyboardButton("▶️ تفعيل", callback_data=f"toggle_src_{src_id}")])
+    rows.append([InlineKeyboardButton("✏️ تعديل", callback_data=f"edit_src_{src_id}")])
+    rows.append([InlineKeyboardButton("🗑 حذف المصدر", callback_data=f"del_src_{src_id}")])
+    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="list_sources")])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_pf(p) -> str:
+    coins = ", ".join(c.symbol for c in p.coins) or "—"
+    status = "🟢 شغالة" if p.is_running else "⚪ متوقفة"
+    return (
+        f"📁 *{p.name}* (#{p.id})\n"
+        f"الحالة: {status}\n"
+        f"المخصص: `{p.investment_usdt:.2f}` USDT\n"
+        f"العملات: `{coins}`\n"
+        f"العتبة: `{p.threshold}%`"
+    )
+
+
+def format_source(s) -> str:
+    return (
+        f"📡 *{s.name}* (#{s.id})\n"
+        f"الحالة: {'🟢 مفعل' if s.enabled else '🔴 معطل'}\n"
+        f"الحد الأدنى: `{s.min_usd:,.0f}$`\n"
+        f"أقصى تحويلات: `{s.max_tx_count}`\n"
+        f"شراء مسموح: {'نعم' if s.allow_buy else 'لا'}\n"
+        f"بيع مسموح: {'نعم' if s.allow_sell else 'لا'}\n"
+        f"محافظ الشراء: `{s.buy_portfolio_ids or '—'}`\n"
+        f"محافظ البيع: `{s.sell_portfolio_ids or '—'}`\n"
+        f"التبريد: `{s.cooldown_minutes}` دقيقة"
+    )
+
+
+def parse_signal_message(text: str) -> Optional[Dict[str, Any]]:
+    """
+    يدعم صيغتين:
+    1) المنظمة: #SIGNAL / إشارة + Source/Action/...
+    2) تنبيه Arkham: From: ... To: ... Value: ... ($X)
+    """
+    if not text or len(text) < 8:
+        return None
+    text = text.strip()
+    lower = text.lower()
+    result = {"source": None, "action": None, "reason": "", "portfolios": [], "size": "full", "raw": text[:1500], "usd_value": 0.0}
+
+    # ---------- صيغة Arkham ----------
+    # From: Coinbase ... To: BlackRock ...  => BUY
+    # From: BlackRock ... To: Coinbase ...  => SELL
+    from_m = re.search(r"From\s*:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
+    to_m = re.search(r"To\s*:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
+    if from_m and to_m:
+        from_s = from_m.group(1).strip().lower()
+        to_s = to_m.group(1).strip().lower()
+        is_from_cb = "coinbase" in from_s
+        is_to_cb = "coinbase" in to_s
+        is_from_br = "blackrock" in from_s or "ibit" in from_s or "etha" in from_s
+        is_to_br = "blackrock" in to_s or "ibit" in to_s or "etha" in to_s
+
+        if is_from_cb and is_to_br:
+            result["action"] = "BUY"
+            result["source"] = "BlackRock"
+            result["reason"] = f"Withdrawal from Coinbase → BlackRock | {from_m.group(1).strip()[:80]}"
+        elif is_from_br and is_to_cb:
+            result["action"] = "SELL"
+            result["source"] = "BlackRock"
+            result["reason"] = f"Deposit to Coinbase from BlackRock | {to_m.group(1).strip()[:80]}"
+
+        # استخراج القيمة بالدولار
+        # Value: 113.227030 BTC ($8,681,003.18)  أو  ($8.6M)
+        usd_m = re.search(r"\(\$([0-9,]+(?:\.[0-9]+)?)\s*([KMB])?\)", text, re.IGNORECASE)
+        if usd_m:
+            num = float(usd_m.group(1).replace(",", ""))
+            mult = {"K": 1e3, "M": 1e6, "B": 1e9}.get((usd_m.group(2) or "").upper(), 1)
+            result["usd_value"] = num * mult
+        else:
+            # Value: $8,681,003.18
+            usd_m2 = re.search(r"Value\s*:.*?\$([0-9,]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
+            if usd_m2:
+                result["usd_value"] = float(usd_m2.group(1).replace(",", ""))
+
+        if result["action"]:
+            return result
+
+    # ---------- الصيغة المنظمة ----------
+    if not any(k in lower for k in ("#signal", "إشارة", "اشارة", "signal")):
+        return None
+
+    m = re.search(r"(?:source|المصدر)\s*[:：]\s*(.+)", text, re.IGNORECASE)
+    if m:
+        result["source"] = m.group(1).strip().split("\n")[0].strip()
+    m = re.search(r"(?:action|القرار|قرار)\s*[:：]\s*(.+)", text, re.IGNORECASE)
+    if m:
+        act = m.group(1).strip().upper()
+        if any(x in act for x in ("BUY", "شراء", "LONG")):
+            result["action"] = "BUY"
+        elif any(x in act for x in ("SELL", "بيع", "SHORT")):
+            result["action"] = "SELL"
+    m = re.search(r"(?:reason|السبب|سبب)\s*[:：]\s*(.+)", text, re.IGNORECASE)
+    if m:
+        result["reason"] = m.group(1).strip().split("\n")[0][:300]
+    m = re.search(r"(?:portfolios|المحافظ|محافظ)\s*[:：]\s*([0-9,\s]+)", text, re.IGNORECASE)
+    if m:
+        result["portfolios"] = parse_portfolio_ids(m.group(1))
+    m = re.search(r"(?:size|الحجم|حجم)\s*[:：]\s*(.+)", text, re.IGNORECASE)
+    if m:
+        result["size"] = m.group(1).strip().lower()
+    if result["action"] and (result["source"] or result["portfolios"]):
+        return result
+    return None
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_admin(update):
+        return
+    db = SessionLocal()
+    try:
+        get_or_create_user(db, update.effective_user.id)
+    finally:
+        db.close()
+    await update.message.reply_text(
+        "👋 *MEXC Portfolio Manager + Signal Engine*\n\nإدارة محافظك + تنفيذ إشارات ذكية من المجموعة.",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("تم الإلغاء.", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("القائمة الرئيسية:", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
+
+async def execute_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: Dict):
+    tid = update.effective_user.id
+    db = SessionLocal()
+    try:
+        source_name = parsed.get("source")
+        action = parsed["action"]
+        reason = parsed.get("reason", "")
+        explicit_pfs = parsed.get("portfolios", [])
+
+        sources = get_signal_sources(db, tid)
+        matched = None
+        enabled_sources = [s for s in sources if s.enabled]
+
+        # 1) مطابقة بالاسم بالظبط
+        if source_name:
+            for s in enabled_sources:
+                if s.name.lower() == source_name.lower():
+                    matched = s
+                    break
+
+        # 2) لو رسالة Arkham (From/To) ومفيش مطابقة بالاسم:
+        #    فضّل مصدر اسمه فيه arkham أو blackrock، وإلا أول مصدر مفعل
+        is_arkham_msg = bool(parsed.get("usd_value")) or (
+            "from:" in (parsed.get("raw") or "").lower() and "to:" in (parsed.get("raw") or "").lower()
+        )
+        if not matched and is_arkham_msg and enabled_sources:
+            for s in enabled_sources:
+                n = s.name.lower()
+                if "arkham" in n or "blackrock" in n or "ibit" in n:
+                    matched = s
+                    break
+            if not matched:
+                matched = enabled_sources[0]
+
+        if not matched and not explicit_pfs:
+            await update.message.reply_text(
+                f"⚠️ مصدر الإشارة `{source_name or 'Arkham'}` غير موجود أو معطل.\nأضف مصدر مفعل من قائمة مصادر الإشارات.",
+                parse_mode="Markdown"
+            )
+            log_signal(db, tid, action, reason, parsed.get("raw", ""), executed=False, result_msg="مصدر غير موجود")
+            return
+
+        if explicit_pfs:
+            target_ids = explicit_pfs
+        elif matched:
+            target_ids = parse_portfolio_ids(
+                matched.buy_portfolio_ids if action == "BUY" else matched.sell_portfolio_ids
+            )
+        else:
+            target_ids = []
+
+        if not target_ids:
+            await update.message.reply_text("⚠️ مفيش محافظ مرتبطة بهذه الإشارة.")
+            log_signal(db, tid, action, reason, parsed.get("raw", ""),
+                       source_id=matched.id if matched else None, executed=False, result_msg="لا محافظ")
+            return
+
+        # ----- تحقق القيمة -----
+        usd_val = float(parsed.get("usd_value") or 0)
+        if matched and usd_val > 0 and usd_val < matched.min_usd:
+            await update.message.reply_text(
+                f"ℹ️ تم تجاهل الإشارة — القيمة `${usd_val:,.0f}` أقل من الحد `${matched.min_usd:,.0f}`",
+                parse_mode="Markdown"
+            )
+            log_signal(db, tid, action, reason, parsed.get("raw", ""),
+                       source_id=matched.id, executed=False,
+                       result_msg=f"تحت الحد: {usd_val} < {matched.min_usd}")
+            return
+
+        # ----- cooldown بعد تنفيذ ناجح -----
+        if matched and matched.cooldown_minutes > 0:
+            cutoff = datetime.utcnow() - timedelta(minutes=matched.cooldown_minutes)
+            recent = db.query(SignalLog).filter(
+                SignalLog.source_id == matched.id,
+                SignalLog.action == action,
+                SignalLog.executed == True,
+                SignalLog.created_at >= cutoff
+            ).first()
+            if recent:
+                await update.message.reply_text(f"⏳ تم تجاهل الإشارة (cooldown {matched.cooldown_minutes} دقيقة بعد آخر تنفيذ).")
+                return
+
+        # ----- تجميع التحويلات (max_tx_count) -----
+        # نافذة التجميع = cooldown_minutes (أو 60 دقيقة افتراضي)
+        window_min = matched.cooldown_minutes if matched and matched.cooldown_minutes > 0 else 60
+        needed = matched.max_tx_count if matched and matched.max_tx_count > 0 else 1
+
+        if matched and needed > 1:
+            window_start = datetime.utcnow() - timedelta(minutes=window_min)
+            # التحويلات المعلقة (غير منفذة) في النافذة + الحالية
+            pending = db.query(SignalLog).filter(
+                SignalLog.source_id == matched.id,
+                SignalLog.action == action,
+                SignalLog.executed == False,
+                SignalLog.created_at >= window_start,
+                SignalLog.result_msg.like("pending%")  # علامة الانتظار
+            ).count()
+
+            current_count = pending + 1  # + الرسالة الحالية
+
+            if current_count < needed:
+                # سجّل كـ pending
+                log_signal(
+                    db, tid, action, reason, parsed.get("raw", ""),
+                    source_id=matched.id, executed=False,
+                    result_msg=f"pending {current_count}/{needed}"
+                )
+                remaining = needed - current_count
+                total_usd_approx = ""
+                if usd_val > 0:
+                    total_usd_approx = f"\nآخر تحويل: `${usd_val:,.0f}`"
+                await update.message.reply_text(
+                    f"📥 *تحويل مستلم* ({current_count}/{needed})\n"
+                    f"المصدر: `{matched.name}`\n"
+                    f"القرار: *{action}*\n"
+                    f"السبب: {reason or '—'}\n"
+                    f"{total_usd_approx}\n\n"
+                    f"⏳ باقي *{remaining}* تحويل"
+                    f"{'ات' if remaining >= 3 else ('ان' if remaining == 2 else '')}"
+                    f" خلال {window_min} دقيقة لتنفيذ الأمر.",
+                    parse_mode="Markdown"
+                )
+                return
+            else:
+                # وصلنا للعدد المطلوب → نكمّل التنفيذ
+                # علّم الـ pending السابقة كـ consumed
+                window_start = datetime.utcnow() - timedelta(minutes=window_min)
+                old_pending = db.query(SignalLog).filter(
+                    SignalLog.source_id == matched.id,
+                    SignalLog.action == action,
+                    SignalLog.executed == False,
+                    SignalLog.created_at >= window_start,
+                    SignalLog.result_msg.like("pending%")
+                ).all()
+                for op in old_pending:
+                    op.result_msg = f"consumed→exec {needed}"
+                db.commit()
+
+        if matched:
+            if action == "BUY" and not matched.allow_buy:
+                await update.message.reply_text("⚠️ المصدر ده مش مسموح له إشارات شراء.")
+                return
+            if action == "SELL" and not matched.allow_sell:
+                await update.message.reply_text("⚠️ المصدر ده مش مسموح له إشارات بيع.")
+                return
+
+        executed, errors = [], []
+        for pf_id in target_ids:
+            p = get_portfolio(db, pf_id, tid)
+            if not p or p.status != "active":
+                errors.append(f"#{pf_id} غير موجودة")
+                continue
+            coins = [c.symbol for c in p.coins]
+            if not coins:
+                errors.append(f"#{pf_id} بدون عملات")
+                continue
+            try:
+                if action == "BUY":
+                    if p.is_running:
+                        errors.append(f"#{pf_id} شغالة بالفعل")
+                        continue
+                    result = get_reb().start_portfolio(
+                        coins=coins, total_usdt=p.investment_usdt,
+                        method=p.allocation_method or "equal", min_trade_usdt=5.0, dry_run=False,
+                    )
+                    if result.get("errors") and not result.get("executed"):
+                        errors.append(f"#{pf_id}: {result['errors'][0]}")
+                    else:
+                        set_portfolio_running(db, pf_id, True)
+                        executed.append(f"#{pf_id} ({p.name})")
+                        log_action(db, tid, "signal_buy", f"Signal from {source_name}", True, pf_id)
+                else:
+                    if not p.is_running:
+                        errors.append(f"#{pf_id} متوقفة بالفعل")
+                        continue
+                    get_reb().stop_portfolio(coins, dry_run=False)
+                    set_portfolio_running(db, pf_id, False)
+                    executed.append(f"#{pf_id} ({p.name})")
+                    log_action(db, tid, "signal_sell", f"Signal from {source_name}", True, pf_id)
+            except Exception as e:
+                errors.append(f"#{pf_id}: {e}")
+                logger.exception(f"Signal exec error pf={pf_id}")
+
+        lines = [
+            f"{'✅' if executed else '⚠️'} *نتيجة الإشارة*",
+            f"المصدر: `{source_name or '—'}`",
+            f"القرار: *{action}*",
+            f"السبب: {reason or '—'}",
+            "",
+        ]
+        if executed:
+            lines.append("تم التنفيذ على:")
+            for e in executed:
+                lines.append(f"  • {e}")
+        if errors:
+            lines.append("\nملاحظات:")
+            for e in errors:
+                lines.append(f"  • {e}")
+        msg = "\n".join(lines)
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        log_signal(db, tid, action, reason, parsed.get("raw", ""),
+                   source_id=matched.id if matched else None,
+                   executed=bool(executed), result_msg=msg[:500])
+    finally:
+        db.close()
+
+
+async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    if not await ensure_admin(update):
+        return
+    if context.user_data.get("waiting"):
+        return
+    parsed = parse_signal_message(update.message.text)
+    if parsed:
+        await execute_signal(update, context, parsed)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await ensure_admin(update):
+        return
+    data = query.data or ""
+    tid = update.effective_user.id
+
+    if data == "menu":
+        await query.edit_message_text("القائمة الرئيسية:", reply_markup=main_menu_keyboard())
+        return
+
+    if data == "list_pf":
+        db = SessionLocal()
+        try:
+            pfs = get_portfolios(db, tid, status="active")
+            if not pfs:
+                await query.edit_message_text("لا توجد محافظ نشطة.\nاضغط ➕ لإنشاء محفظة.", reply_markup=main_menu_keyboard())
+                return
+            buttons = [[InlineKeyboardButton(f"{'🟢' if p.is_running else '⚪'} #{p.id} {p.name} ({p.investment_usdt:.0f}$)", callback_data=f"view_{p.id}")] for p in pfs]
+            buttons.append([InlineKeyboardButton("⬅️ القائمة", callback_data="menu")])
+            await query.edit_message_text("📋 *محافظك النشطة:*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+        finally:
+            db.close()
+        return
+
+    if data.startswith("view_") and not data.startswith("view_src_"):
+        pf_id = int(data.split("_")[1])
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, pf_id, tid)
+            if not p:
+                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
+                return
+            coins = [c.symbol for c in p.coins]
+            live = ""
+            if coins:
+                try:
+                    val = get_mexc().get_coins_value(coins)
+                    live = f"\nالقيمة الحالية: `{val['total_usdt']:.2f}` USDT"
+                except Exception:
+                    pass
+            await query.edit_message_text(format_pf(p) + live, parse_mode="Markdown", reply_markup=pf_keyboard(p.id, p.is_running))
+        finally:
+            db.close()
+        return
+
+    if data == "balance":
+        try:
+            data_bal = get_mexc().get_portfolio_value()
+            free = get_mexc().get_free_usdt()
+            lines = [f"💰 *الرصيد الكلي:* `{data_bal['total_usdt']:.2f}` USDT", f"USDT حر: `{free:.2f}`\n"]
+            for asset, info in sorted(data_bal["assets"].items(), key=lambda x: -x[1]["usdt_value"])[:15]:
+                if info["usdt_value"] < 0.5:
+                    continue
+                lines.append(f"`{asset}`: {info['amount']:.6g} ≈ `{info['usdt_value']:.2f}$`")
+            await query.edit_message_text("\n".join(lines), parse_mode="Markdown",
+                                          reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="menu")]]))
+        except Exception as e:
+            await query.edit_message_text(f"خطأ:\n`{e}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        return
+
+    if data == "settings":
+        db = SessionLocal()
+        try:
+            user = get_or_create_user(db, tid)
+            text = (f"⚙️ *الإعدادات*\n\nعتبة إعادة التوازن: `{user.default_threshold}%`\n"
+                    f"أقل صفقة: `{user.min_trade_usdt}` USDT\nأقصى عملات لكل محفظة: `{user.max_coins_per_portfolio}`\n")
+            await query.edit_message_text(text, parse_mode="Markdown",
+                                          reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="menu")]]))
+        finally:
+            db.close()
+        return
+
+    if data == "create_pf":
+        context.user_data["create"] = {}
+        context.user_data["waiting"] = True
+        await query.edit_message_text("أرسل *اسم المحفظة*:", parse_mode="Markdown")
+        return CREATE_NAME
+
+    if data.startswith("start_"):
+        await _do_start(query, tid, int(data.split("_")[1]))
+        return
+    if data.startswith("stop_"):
+        await _do_stop(query, tid, int(data.split("_")[1]))
+        return
+    if data.startswith("increase_"):
+        context.user_data["increase_pf"] = int(data.split("_")[1])
+        context.user_data["waiting"] = True
+        await query.edit_message_text("أرسل مبلغ الزيادة بالـ USDT:")
+        return INCREASE_AMOUNT
+    if data.startswith("rebal_dry_"):
+        await _do_rebalance(query, tid, int(data.split("_")[2]), dry_run=True)
+        return
+    if data.startswith("rebal_run_"):
+        await _do_rebalance(query, tid, int(data.split("_")[2]), dry_run=False)
+        return
+    if data.startswith("addcoin_"):
+        context.user_data["addcoin_pf"] = int(data.split("_")[1])
+        context.user_data["waiting"] = True
+        await query.edit_message_text("أرسل رمز العملة (مثال: BTC أو ETH):")
+        return ADD_COIN
+    if data.startswith("removecoin_"):
+        pf_id = int(data.split("_")[1])
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, pf_id, tid)
+            if not p or not p.coins:
+                await query.edit_message_text("لا توجد عملات.", reply_markup=main_menu_keyboard())
+                return
+            buttons = [[InlineKeyboardButton(f"حذف {c.symbol}", callback_data=f"delcoin_{pf_id}_{c.symbol}")] for c in p.coins]
+            buttons.append([InlineKeyboardButton("⬅️ رجوع", callback_data=f"view_{pf_id}")])
+            await query.edit_message_text("اختر العملة للحذف:", reply_markup=InlineKeyboardMarkup(buttons))
+        finally:
+            db.close()
+        return
+    if data.startswith("delcoin_"):
+        parts = data.split("_")
+        await _do_remove_coin(query, tid, int(parts[1]), parts[2])
+        return
+    if data.startswith("close_"):
+        pf_id = int(data.split("_")[1])
+        await query.edit_message_text(
+            "⚠️ هل أنت متأكد من حذف المحفظة؟",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ نعم، احذفها", callback_data=f"confirm_close_{pf_id}")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data=f"view_{pf_id}")],
+            ])
+        )
+        return
+    if data.startswith("confirm_close_"):
+        await _do_close(query, tid, int(data.split("_")[2]))
+        return
+
+    # Signal sources
+    if data == "list_sources":
+        db = SessionLocal()
+        try:
+            sources = get_signal_sources(db, tid)
+            text = "📡 *مصادر الإشارات:*\n\n" if sources else "لا توجد مصادر بعد.\nاضغط ➕ لإضافة مصدر."
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=sources_keyboard(sources))
+        finally:
+            db.close()
+        return
+
+    if data == "create_src":
+        context.user_data["src"] = {}
+        context.user_data["waiting"] = True
+        await query.edit_message_text("أرسل *اسم المصدر* (مثال: BlackRock):", parse_mode="Markdown")
+        return SRC_NAME
+
+    if data.startswith("view_src_"):
+        src_id = int(data.split("_")[2])
+        db = SessionLocal()
+        try:
+            s = get_signal_source(db, src_id, tid)
+            if not s:
+                await query.edit_message_text("المصدر غير موجود.", reply_markup=main_menu_keyboard())
+                return
+            await query.edit_message_text(format_source(s), parse_mode="Markdown",
+                                          reply_markup=source_detail_keyboard(s.id, s.enabled))
+        finally:
+            db.close()
+        return
+
+    if data.startswith("toggle_src_"):
+        src_id = int(data.split("_")[2])
+        db = SessionLocal()
+        try:
+            s = get_signal_source(db, src_id, tid)
+            if s:
+                s.enabled = not s.enabled
+                db.commit()
+                await query.edit_message_text(format_source(s), parse_mode="Markdown",
+                                              reply_markup=source_detail_keyboard(s.id, s.enabled))
+        finally:
+            db.close()
+        return
+
+    if data.startswith("del_src_"):
+        src_id = int(data.split("_")[2])
+        db = SessionLocal()
+        try:
+            delete_signal_source(db, src_id, tid)
+            sources = get_signal_sources(db, tid)
+            await query.edit_message_text("✅ تم حذف المصدر.", reply_markup=sources_keyboard(sources))
+        finally:
+            db.close()
+        return
+
+    if data.startswith("edit_src_"):
+        src_id = int(data.split("_")[2])
+        context.user_data["edit_src_id"] = src_id
+        await query.edit_message_text(
+            "✏️ *اختر الحقل للتعديل:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("الحد الأدنى ($)", callback_data=f"editf_min_usd_{src_id}")],
+                [InlineKeyboardButton("أقصى تحويلات", callback_data=f"editf_max_tx_{src_id}")],
+                [InlineKeyboardButton("محافظ الشراء", callback_data=f"editf_buy_pfs_{src_id}")],
+                [InlineKeyboardButton("محافظ البيع", callback_data=f"editf_sell_pfs_{src_id}")],
+                [InlineKeyboardButton("التبريد (دقيقة)", callback_data=f"editf_cooldown_{src_id}")],
+                [InlineKeyboardButton("⬅️ رجوع", callback_data=f"view_src_{src_id}")],
+            ])
+        )
+        return
+
+    if data.startswith("editf_"):
+        # editf_min_usd_1  or editf_buy_pfs_1
+        parts = data.split("_")
+        # editf, field..., src_id
+        src_id = int(parts[-1])
+        field = "_".join(parts[1:-1])  # min_usd / max_tx / buy_pfs / sell_pfs / cooldown
+        field_map = {
+            "min_usd": ("min_usd", "أرسل الحد الأدنى بالدولار (مثال: 1000000):"),
+            "max_tx": ("max_tx_count", "أرسل أقصى عدد تحويلات (مثال: 3):"),
+            "buy_pfs": ("buy_portfolio_ids", "أرسل أرقام محافظ الشراء مفصولة بفاصلة (مثال: 1,2)\nأو none:"),
+            "sell_pfs": ("sell_portfolio_ids", "أرسل أرقام محافظ البيع مفصولة بفاصلة (مثال: 1,2)\nأو none:"),
+            "cooldown": ("cooldown_minutes", "أرسل مدة التبريد بالدقائق (مثال: 30):"),
+        }
+        if field not in field_map:
+            await query.edit_message_text("حقل غير معروف.", reply_markup=main_menu_keyboard())
+            return
+        db_field, prompt = field_map[field]
+        context.user_data["edit_src_id"] = src_id
+        context.user_data["edit_src_field"] = db_field
+        context.user_data["waiting"] = True
+        await query.edit_message_text(prompt)
+        return EDIT_SRC_VALUE
+
+
+async def _do_start(query, tid, pf_id):
+    db = SessionLocal()
+    try:
+        p = get_portfolio(db, pf_id, tid)
+        if not p:
+            await query.edit_message_text("غير موجودة.", reply_markup=main_menu_keyboard())
+            return
+        coins = [c.symbol for c in p.coins]
+        if not coins:
+            await query.edit_message_text("المحفظة بدون عملات.", reply_markup=pf_keyboard(pf_id, False))
+            return
+        if p.is_running:
+            await query.edit_message_text("المحفظة شغالة مسبقاً.", reply_markup=pf_keyboard(pf_id, True))
+            return
+        await query.edit_message_text("⏳ جاري الشراء...")
+        result = get_reb().start_portfolio(coins=coins, total_usdt=p.investment_usdt,
+                                           method=p.allocation_method or "equal", min_trade_usdt=5.0, dry_run=False)
+        if result.get("errors") and not result.get("executed"):
+            err = "\n".join(str(e) for e in result["errors"])
+            await query.edit_message_text(f"❌ فشل:\n`{err}`", parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, False))
+            return
+        set_portfolio_running(db, pf_id, True)
+        log_action(db, tid, "start", f"Started {p.name}", True, pf_id)
+        await query.edit_message_text(f"✅ تم تشغيل *{p.name}*", parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, True))
+    finally:
+        db.close()
+
+
+async def _do_stop(query, tid, pf_id):
+    db = SessionLocal()
+    try:
+        p = get_portfolio(db, pf_id, tid)
+        if not p:
+            await query.edit_message_text("غير موجودة.", reply_markup=main_menu_keyboard())
+            return
+        coins = [c.symbol for c in p.coins]
+        await query.edit_message_text("⏳ جاري البيع...")
+        if coins:
+            get_reb().stop_portfolio(coins, dry_run=False)
+        set_portfolio_running(db, pf_id, False)
+        log_action(db, tid, "stop", f"Stopped {p.name}", True, pf_id)
+        await query.edit_message_text(f"⏹ تم إيقاف *{p.name}*", parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, False))
+    finally:
+        db.close()
+
+
+async def _do_rebalance(query, tid, pf_id, dry_run: bool):
+    db = SessionLocal()
+    try:
+        p = get_portfolio(db, pf_id, tid)
+        if not p:
+            await query.edit_message_text("غير موجودة.", reply_markup=main_menu_keyboard())
+            return
+        coins = [c.symbol for c in p.coins]
+        if not coins:
+            await query.edit_message_text("بدون عملات.", reply_markup=pf_keyboard(pf_id, p.is_running))
+            return
+        await query.edit_message_text("⏳ جاري الحساب..." if dry_run else "⏳ جاري التنفيذ...")
+        result = get_reb().rebalance(coins=coins, total_usdt=p.investment_usdt,
+                                     method=p.allocation_method or "equal", threshold_pct=p.threshold,
+                                     min_trade_usdt=5.0, dry_run=dry_run)
+        msg = result.get("summary", str(result))
+        await query.edit_message_text(f"{'🔄 معاينة' if dry_run else '✅ تم'}:\n`{msg}`", parse_mode="Markdown",
+                                      reply_markup=pf_keyboard(pf_id, p.is_running))
+    finally:
+        db.close()
+
+
+async def _do_remove_coin(query, tid, pf_id, symbol):
+    db = SessionLocal()
+    try:
+        p = get_portfolio(db, pf_id, tid)
+        if not p:
+            await query.edit_message_text("غير موجودة.", reply_markup=main_menu_keyboard())
+            return
+        try:
+            get_reb().stop_portfolio([symbol], dry_run=False)
+        except Exception:
+            pass
+        remove_coin_from_portfolio(db, pf_id, symbol)
+        await query.edit_message_text(f"✅ تم حذف `{symbol}`", parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, p.is_running))
+    finally:
+        db.close()
+
+
+async def _do_close(query, tid, pf_id):
+    db = SessionLocal()
+    try:
+        p = get_portfolio(db, pf_id, tid)
+        if not p:
+            await query.edit_message_text("غير موجودة.", reply_markup=main_menu_keyboard())
+            return
+        coins = [c.symbol for c in p.coins]
+        if p.is_running and coins:
+            get_reb().stop_portfolio(coins, dry_run=False)
+        close_portfolio(db, pf_id)
+        await query.edit_message_text("✅ تم حذف المحفظة.", reply_markup=main_menu_keyboard())
+    finally:
+        db.close()
+
+
+async def create_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["create"]["name"] = update.message.text.strip()
+    await update.message.reply_text("أرسل *مبلغ الاستثمار* بالـ USDT:", parse_mode="Markdown")
+    return CREATE_AMOUNT
+
+
+async def create_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = float(update.message.text.strip().replace(",", ""))
+        if amount < 5:
+            await update.message.reply_text("المبلغ لازم يكون ≥ 5 USDT")
+            return CREATE_AMOUNT
+        context.user_data["create"]["amount"] = amount
+    except ValueError:
+        await update.message.reply_text("أدخل رقم صحيح.")
+        return CREATE_AMOUNT
+    await update.message.reply_text("أرسل رموز العملات مفصولة بمسافة\nمثال: `BTC ETH SOL`", parse_mode="Markdown")
+    return CREATE_COINS
+
+
+async def create_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip().upper().replace(",", " ")
+    coins = [c.strip() for c in raw.split() if c.strip()]
+    if not coins:
+        await update.message.reply_text("أدخل عملة واحدة على الأقل.")
+        return CREATE_COINS
+    if len(coins) > 30:
+        await update.message.reply_text("الحد الأقصى 30 عملة.")
+        return CREATE_COINS
+    data = context.user_data["create"]
+    db = SessionLocal()
+    try:
+        p = create_portfolio(db, update.effective_user.id, data["name"], data["amount"], coins)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ تم إنشاء *{p.name}* (#{p.id})\nالمبلغ: `{p.investment_usdt}`\nالعملات: `{', '.join(coins)}`",
+            parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+
+async def add_coin_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    symbol = update.message.text.strip().upper()
+    pf_id = context.user_data.get("addcoin_pf")
+    if not pf_id:
+        context.user_data.clear()
+        await update.message.reply_text("حدث خطأ.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, update.effective_user.id)
+        ok, msg = add_coin_to_portfolio(db, pf_id, symbol, max_coins=user.max_coins_per_portfolio or 30)
+        context.user_data.clear()
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+
+async def increase_amount_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = float(update.message.text.strip().replace(",", ""))
+        if amount <= 0:
+            await update.message.reply_text("المبلغ لازم يكون موجب.")
+            return INCREASE_AMOUNT
+    except ValueError:
+        await update.message.reply_text("أدخل رقم صحيح.")
+        return INCREASE_AMOUNT
+    pf_id = context.user_data.get("increase_pf")
+    db = SessionLocal()
+    try:
+        p = get_portfolio(db, pf_id, update.effective_user.id)
+        if not p:
+            await update.message.reply_text("غير موجودة.", reply_markup=main_menu_keyboard())
+            context.user_data.clear()
+            return ConversationHandler.END
+        p.investment_usdt += amount
+        db.commit()
+        if p.is_running:
+            coins = [c.symbol for c in p.coins]
+            if coins:
+                get_reb().start_portfolio(coins=coins, total_usdt=amount,
+                                          method=p.allocation_method or "equal", min_trade_usdt=5.0, dry_run=False)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ تم زيادة `{amount}` USDT\nالمخصص الجديد: `{p.investment_usdt:.2f}`",
+            parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+
+async def src_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if len(name) < 2:
+        await update.message.reply_text("الاسم قصير جداً.")
+        return SRC_NAME
+    context.user_data["src"]["name"] = name
+    await update.message.reply_text("أرسل *الحد الأدنى للقيمة بالدولار* (مثال: 15000000):", parse_mode="Markdown")
+    return SRC_MIN_USD
+
+
+async def src_min_usd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = float(update.message.text.strip().replace(",", "").replace("_", ""))
+        context.user_data["src"]["min_usd"] = val
+    except ValueError:
+        await update.message.reply_text("أدخل رقم صحيح.")
+        return SRC_MIN_USD
+    await update.message.reply_text("أرسل *أقصى عدد تحويلات* (مثال: 3):")
+    return SRC_MAX_TX
+
+
+async def src_max_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text.strip())
+        context.user_data["src"]["max_tx_count"] = val
+    except ValueError:
+        await update.message.reply_text("أدخل رقم صحيح.")
+        return SRC_MAX_TX
+    await update.message.reply_text("أرسل *أرقام محافظ الشراء* مفصولة بفاصلة (مثال: 1,3,5)\nأو `none`:", parse_mode="Markdown")
+    return SRC_BUY_PFS
+
+
+async def src_buy_pfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower()
+    context.user_data["src"]["buy_portfolio_ids"] = "" if text == "none" else text.replace(" ", "")
+    await update.message.reply_text("أرسل *أرقام محافظ البيع* مفصولة بفاصلة (مثال: 2,4)\nأو `none`:", parse_mode="Markdown")
+    return SRC_SELL_PFS
+
+
+async def src_sell_pfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower()
+    data = context.user_data["src"]
+    data["sell_portfolio_ids"] = "" if text == "none" else text.replace(" ", "")
+    db = SessionLocal()
+    try:
+        src = create_signal_source(
+            db, update.effective_user.id,
+            name=data["name"],
+            min_usd=data.get("min_usd", 15_000_000),
+            max_tx_count=data.get("max_tx_count", 3),
+            buy_portfolio_ids=data.get("buy_portfolio_ids", ""),
+            sell_portfolio_ids=data.get("sell_portfolio_ids", ""),
+        )
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ تم إنشاء مصدر *{src.name}*\n\n{format_source(src)}",
+            parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+
+async def edit_src_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    src_id = context.user_data.get("edit_src_id")
+    field = context.user_data.get("edit_src_field")
+    text = update.message.text.strip()
+    if not src_id or not field:
+        context.user_data.clear()
+        await update.message.reply_text("حدث خطأ.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    kwargs = {}
+    try:
+        if field == "min_usd":
+            kwargs["min_usd"] = float(text.replace(",", "").replace("_", ""))
+        elif field == "max_tx_count":
+            kwargs["max_tx_count"] = int(text)
+        elif field == "cooldown_minutes":
+            kwargs["cooldown_minutes"] = int(text)
+        elif field in ("buy_portfolio_ids", "sell_portfolio_ids"):
+            kwargs[field] = "" if text.lower() == "none" else text.replace(" ", "")
+        else:
+            await update.message.reply_text("حقل غير مدعوم.")
+            return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("قيمة غير صحيحة، حاول مرة أخرى.")
+        return EDIT_SRC_VALUE
+
+    db = SessionLocal()
+    try:
+        src = update_signal_source(db, src_id, **kwargs)
+        context.user_data.clear()
+        if src:
+            await update.message.reply_text(
+                f"✅ تم التعديل\n\n{format_source(src)}",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard()
+            )
+        else:
+            await update.message.reply_text("المصدر غير موجود.", reply_markup=main_menu_keyboard())
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+
+def main():
+    if not config.TELEGRAM_BOT_TOKEN:
+        raise SystemExit("TELEGRAM_BOT_TOKEN مطلوب")
+    if not config.MEXC_API_KEY or not config.MEXC_API_SECRET:
+        raise SystemExit("MEXC_API_KEY و MEXC_API_SECRET مطلوبان")
+    if not config.DATABASE_URL:
+        raise SystemExit("DATABASE_URL مطلوب")
+
+    init_db()
+    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+
+    async def entry_create(update, context):
+        await on_callback(update, context)
+        return CREATE_NAME
+
+    async def entry_addcoin(update, context):
+        await on_callback(update, context)
+        return ADD_COIN
+
+    async def entry_increase(update, context):
+        await on_callback(update, context)
+        return INCREASE_AMOUNT
+
+    async def entry_create_src(update, context):
+        await on_callback(update, context)
+        return SRC_NAME
+
+    async def entry_edit_src(update, context):
+        await on_callback(update, context)
+        return EDIT_SRC_VALUE
+
+    conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(entry_create, pattern="^create_pf$"),
+            CallbackQueryHandler(entry_addcoin, pattern="^addcoin_"),
+            CallbackQueryHandler(entry_increase, pattern="^increase_"),
+            CallbackQueryHandler(entry_create_src, pattern="^create_src$"),
+            CallbackQueryHandler(entry_edit_src, pattern="^editf_"),
+        ],
+        states={
+            CREATE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_name)],
+            CREATE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_amount)],
+            CREATE_COINS: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_coins)],
+            ADD_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_coin_msg)],
+            INCREASE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, increase_amount_msg)],
+            SRC_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, src_name)],
+            SRC_MIN_USD: [MessageHandler(filters.TEXT & ~filters.COMMAND, src_min_usd)],
+            SRC_MAX_TX: [MessageHandler(filters.TEXT & ~filters.COMMAND, src_max_tx)],
+            SRC_BUY_PFS: [MessageHandler(filters.TEXT & ~filters.COMMAND, src_buy_pfs)],
+            SRC_SELL_PFS: [MessageHandler(filters.TEXT & ~filters.COMMAND, src_sell_pfs)],
+            EDIT_SRC_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_src_value)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_cmd)],
+        allow_reentry=True,
+        per_message=False,
+    )
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
+
+    logger.info("Bot starting (Portfolio Manager + Signal Engine)...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
