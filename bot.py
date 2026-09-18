@@ -26,6 +26,8 @@ from database import (
     get_signal_sources, get_signal_source, create_signal_source,
     update_signal_source, delete_signal_source, log_signal, parse_portfolio_ids,
     SignalLog, update_coin_position, reset_coin_positions, get_open_positions,
+    record_trade_event, get_trade_event, get_reentry_candidates,
+    get_portfolio_trade_events,
 )
 from mexc_client import MexcClient
 from rebalancer import Rebalancer
@@ -94,6 +96,11 @@ def pf_keyboard(pf_id: int, is_running: bool):
         rows.append([InlineKeyboardButton("▶️ تشغيل", callback_data=f"start_{pf_id}")])
     rows.append([InlineKeyboardButton("📈 زيادة استثمار", callback_data=f"increase_{pf_id}")])
     rows.append([InlineKeyboardButton("🎯 أهداف هذه المحفظة", callback_data=f"pf_tpsl_{pf_id}")])
+    rows.append([InlineKeyboardButton("🔄 تحديث الأهداف والاستوب", callback_data=f"refresh_tpsl_{pf_id}")])
+    rows.append([
+        InlineKeyboardButton("🛑 الاستوبات / إعادة الدخول", callback_data=f"stopped_{pf_id}"),
+        InlineKeyboardButton("📊 إحصائيات الربح والخسارة", callback_data=f"stats_{pf_id}"),
+    ])
     rows.append([
         InlineKeyboardButton("➕ عملة", callback_data=f"addcoin_{pf_id}"),
         InlineKeyboardButton("➖ عملة", callback_data=f"removecoin_{pf_id}"),
@@ -164,6 +171,40 @@ def format_pf(p) -> str:
                     f"    استوب `{c.current_sl_price:.6g}` ({st})"
                 )
     return "\n".join(lines)
+
+
+def format_portfolio_stats(p, events, prices=None) -> str:
+    """Format realized and current unrealized P&L for one portfolio."""
+    prices = prices or {}
+    realized = sum(float(e.realized_pnl or 0) for e in events)
+    open_cost = 0.0
+    open_value = 0.0
+    open_lines = []
+    for coin in p.coins:
+        if coin.position_status not in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"):
+            continue
+        remaining = float(coin.remaining_amount or coin.amount or 0)
+        entry = float(coin.entry_price or 0)
+        price = float(prices.get(coin.symbol) or entry or 0)
+        if remaining <= 0 or entry <= 0:
+            continue
+        cost = remaining * entry
+        value = remaining * price
+        open_cost += cost
+        open_value += value
+        open_lines.append(f"`{coin.symbol}`: {value - cost:+.2f} USDT")
+    unrealized = open_value - open_cost
+    total = realized + unrealized
+    result = (
+        f"📊 *إحصائيات محفظة {p.name}*\n\n"
+        f"المحقق: `{realized:+.2f}` USDT\n"
+        f"غير المحقق: `{unrealized:+.2f}` USDT\n"
+        f"الإجمالي: `{total:+.2f}` USDT\n"
+        f"عدد العمليات المسجلة: `{len(events)}`"
+    )
+    if open_lines:
+        result += "\n\n*المراكز المفتوحة:*\n" + "\n".join(open_lines)
+    return result
 
 
 def format_source(s) -> str:
@@ -548,7 +589,20 @@ async def execute_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, par
                     if not p.is_running:
                         errors.append(f"#{pf_id} متوقفة بالفعل")
                         continue
-                    get_reb().stop_portfolio(coins, dry_run=False)
+                    sell_result = get_reb().stop_portfolio(coins, dry_run=False)
+                    for sold in sell_result.get("executed", []):
+                        symbol = str(sold.get("symbol", "")).split("/")[0]
+                        coin = next((c for c in p.coins if c.symbol == symbol), None)
+                        amount = float(sold.get("amount") or 0)
+                        usdt = float(sold.get("usdt") or 0)
+                        exit_price = usdt / amount if amount > 0 else 0.0
+                        if coin and amount > 0 and float(coin.entry_price or 0) > 0:
+                            record_trade_event(
+                                db, tid, p.id, coin.id, symbol, "manual_stop",
+                                coin.entry_price, exit_price, amount,
+                                (exit_price - coin.entry_price) * amount,
+                                details="Signal sell",
+                            )
                     set_portfolio_running(db, pf_id, False)
                     executed.append(f"#{pf_id} ({p.name})")
                     log_action(db, tid, "signal_sell", f"Signal from {source_name}", True, pf_id)
@@ -733,6 +787,79 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.close()
         return
 
+    if data.startswith("stats_"):
+        pf_id = int(data.split("_")[1])
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, pf_id, tid)
+            if not p:
+                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
+                return
+            events = get_portfolio_trade_events(db, pf_id, tid)
+            prices = {}
+            symbols = [
+                c.symbol for c in p.coins
+                if c.position_status in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit")
+            ]
+            if symbols:
+                try:
+                    prices = get_mexc().get_all_prices(symbols)
+                except Exception:
+                    prices = {}
+            await query.edit_message_text(
+                format_portfolio_stats(p, events, prices),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 تحديث الإحصائيات", callback_data=f"stats_{pf_id}")],
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+        finally:
+            db.close()
+        return
+
+    if data.startswith("stopped_"):
+        pf_id = int(data.split("_")[1])
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, pf_id, tid)
+            if not p:
+                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
+                return
+            candidates = get_reentry_candidates(db, pf_id, tid)
+            if not candidates:
+                await query.edit_message_text(
+                    f"🛑 لا توجد عملات متاحة لإعادة الدخول في *{p.name}*.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                    ]),
+                )
+                return
+            lines = [f"🛑 *عملات ضربت الاستوب — {p.name}*", "", "اختر العملة لإعادة دخولها يدوياً:"]
+            buttons = []
+            for event in candidates:
+                pnl = float(event.realized_pnl or 0)
+                lines.append(
+                    f"• `{event.symbol}` — خروج `{event.exit_price:.6g}` — "
+                    f"نتيجة `{pnl:+.2f}` USDT"
+                )
+                buttons.append([
+                    InlineKeyboardButton(
+                        f"🔄 إعادة دخول {event.symbol}",
+                        callback_data=f"reentry_{event.id}",
+                    )
+                ])
+            buttons.append([InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")])
+            await query.edit_message_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        finally:
+            db.close()
+        return
+
     if data == "balance":
         try:
             data_bal = get_mexc().get_portfolio_value()
@@ -814,6 +941,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data.startswith("stop_"):
         await _do_stop(query, tid, int(data.split("_")[1]))
+        return
+    if data.startswith("refresh_tpsl_"):
+        await _do_refresh_tpsl(query, tid, int(data.split("_")[2]))
+        return
+    if data.startswith("reentry_"):
+        await _do_manual_reentry(query, tid, int(data.split("_")[1]))
         return
 
     # Per-portfolio TP/SL settings
@@ -1047,6 +1180,208 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return EDIT_SRC_VALUE
 
 
+async def _do_refresh_tpsl(query, tid, pf_id):
+    """Replace TP orders and the monitored SL without selling the portfolio."""
+    db = SessionLocal()
+    try:
+        p = get_portfolio(db, pf_id, tid)
+        if not p:
+            await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
+            return
+        if not p.is_running:
+            await query.edit_message_text(
+                "المحفظة متوقفة؛ شغّلها أولاً حتى يتم تحديث أوامر الأهداف.",
+                reply_markup=pf_keyboard(pf_id, False),
+            )
+            return
+
+        user = get_or_create_user(db, tid)
+
+        def pct(pf_val, user_val, default):
+            if pf_val is not None and float(pf_val) > 0:
+                return float(pf_val)
+            if user_val is not None and float(user_val) > 0:
+                return float(user_val)
+            return default
+
+        tp1 = pct(getattr(p, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
+        tp2 = pct(getattr(p, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
+        tp3 = pct(getattr(p, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
+        s1 = pct(getattr(p, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
+        s2 = pct(getattr(p, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 30.0)
+        sl_pct = pct(getattr(p, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
+
+        await query.edit_message_text("⏳ جاري تحديث أوامر الأهداف والاستوب بدون بيع...")
+        updated = []
+        errors = []
+        for coin in p.coins:
+            if coin.position_status not in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"):
+                continue
+            amount = float(coin.remaining_amount or coin.amount or 0)
+            if amount <= 0 or float(coin.entry_price or 0) <= 0:
+                continue
+            try:
+                get_reb().cancel_tp_orders([{
+                    "symbol": coin.symbol,
+                    "tp_order_id": getattr(coin, "tp_order_id", None),
+                    "tp1_order_id": getattr(coin, "tp1_order_id", None),
+                    "tp2_order_id": getattr(coin, "tp2_order_id", None),
+                    "tp3_order_id": getattr(coin, "tp3_order_id", None),
+                }])
+                skipped = []
+                if coin.position_status in ("tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"):
+                    skipped.append("tp1")
+                if coin.position_status in ("tp2_hit", "tp3_hit", "tp_hit"):
+                    skipped.append("tp2")
+                if coin.position_status in ("tp3_hit", "tp_hit"):
+                    skipped.append("tp3")
+                result = get_reb().place_tp_orders(
+                    [{
+                        "symbol": coin.symbol,
+                        "amount": amount,
+                        "entry_price": coin.entry_price,
+                    }],
+                    tp1, tp2, tp3, sl_pct, s1, s2, skip_stages=skipped,
+                )[0]
+                if result.get("error"):
+                    errors.append(f"{coin.symbol}: {result['error']}")
+                    continue
+                if coin.position_status == "open":
+                    new_sl = result.get("sl_price", 0)
+                elif coin.position_status == "tp1_hit":
+                    new_sl = coin.entry_price
+                elif coin.position_status == "tp2_hit":
+                    new_sl = coin.tp2_price or coin.entry_price
+                else:
+                    new_sl = coin.tp3_price or coin.tp2_price or coin.entry_price
+                update_coin_position(
+                    db,
+                    coin.id,
+                    tp1_price=result.get("tp1_price", coin.tp1_price),
+                    tp2_price=result.get("tp2_price", coin.tp2_price),
+                    tp3_price=result.get("tp3_price", coin.tp3_price),
+                    tp_price=result.get("tp1_price", coin.tp1_price),
+                    current_sl_price=new_sl,
+                    original_sl_price=coin.original_sl_price or result.get("original_sl_price", 0),
+                    tp1_order_id=result.get("tp1_order_id"),
+                    tp2_order_id=result.get("tp2_order_id"),
+                    tp3_order_id=result.get("tp3_order_id"),
+                )
+                updated.append(coin.symbol)
+            except Exception as exc:
+                errors.append(f"{coin.symbol}: {exc}")
+
+        log_action(
+            db, tid, "refresh_tpsl",
+            f"Updated TP/SL for {p.name}: {', '.join(updated) or 'none'}",
+            not errors, pf_id,
+        )
+        lines = [
+            f"✅ تم تحديث الأهداف والاستوب لمحفظة *{p.name}*",
+            "لم يتم بيع أي عملة.",
+            f"القيم الجديدة: TP1 `{tp1}%` | TP2 `{tp2}%` | TP3 `{tp3}%` | SL `{sl_pct}%`",
+        ]
+        if updated:
+            lines.append("العملات: " + ", ".join(f"`{x}`" for x in updated))
+        if errors:
+            lines.append("\n⚠️ ملاحظات:\n" + "\n".join(f"• {x}" for x in errors))
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=pf_keyboard(pf_id, True),
+        )
+    finally:
+        db.close()
+
+
+async def _do_manual_reentry(query, tid, event_id):
+    """Buy a stopped coin again only after the user presses its button."""
+    import asyncio
+
+    db = SessionLocal()
+    try:
+        event = get_trade_event(db, event_id, tid)
+        if not event or event.event_type != "stop_loss" or not event.reentry_available or event.reentry_used:
+            await query.edit_message_text("عملية إعادة الدخول غير متاحة أو تم تنفيذها مسبقاً.", reply_markup=main_menu_keyboard())
+            return
+        pf = get_portfolio(db, event.portfolio_id, tid)
+        coin = next((c for c in (pf.coins if pf else []) if c.id == event.portfolio_coin_id), None)
+        if not pf or not coin:
+            await query.edit_message_text("المحفظة أو العملة غير موجودة.", reply_markup=main_menu_keyboard())
+            return
+        user = get_or_create_user(db, tid)
+
+        def pct(pf_val, user_val, default):
+            if pf_val is not None and float(pf_val) > 0:
+                return float(pf_val)
+            if user_val is not None and float(user_val) > 0:
+                return float(user_val)
+            return default
+
+        tp1 = pct(getattr(pf, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
+        tp2 = pct(getattr(pf, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
+        tp3 = pct(getattr(pf, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
+        s1 = pct(getattr(pf, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
+        s2 = pct(getattr(pf, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 30.0)
+        sl_pct = pct(getattr(pf, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
+        usdt = max(5.0, float(pf.investment_usdt or 0) / max(1, len(pf.coins)))
+
+        await query.edit_message_text(f"⏳ جاري إعادة دخول `{coin.symbol}`...", parse_mode="Markdown")
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: get_reb().reentry_buy_and_place_tp(
+                coin.symbol, usdt, tp1, tp2, tp3, sl_pct, s1, s2,
+            ),
+        )
+        if result.get("error"):
+            await query.edit_message_text(
+                f"⚠️ فشل إعادة دخول `{coin.symbol}`:\n`{result['error']}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛑 الاستوبات / إعادة الدخول", callback_data=f"stopped_{pf.id}")],
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf.id}")],
+                ]),
+            )
+            return
+
+        update_coin_position(
+            db, coin.id,
+            entry_price=result.get("entry_price", 0),
+            tp1_price=result.get("tp1_price", 0),
+            tp2_price=result.get("tp2_price", 0),
+            tp3_price=result.get("tp3_price", 0),
+            tp_price=result.get("tp1_price", 0),
+            current_sl_price=result.get("sl_price", 0),
+            original_sl_price=result.get("original_sl_price") or result.get("sl_price", 0),
+            amount=result.get("amount", 0),
+            remaining_amount=result.get("amount", 0),
+            tp1_order_id=result.get("tp1_order_id"),
+            tp2_order_id=result.get("tp2_order_id"),
+            tp3_order_id=result.get("tp3_order_id"),
+            position_status="open",
+            reentry_used=True,
+            reentry_touched=False,
+            reentry_price=0.0,
+        )
+        event.reentry_available = False
+        event.reentry_used = True
+        db.commit()
+        log_action(db, tid, "manual_reentry", f"Manual re-entry for {coin.symbol}", True, pf.id)
+        await query.edit_message_text(
+            f"✅ تمت إعادة دخول `{coin.symbol}` في محفظة *{pf.name}*\n"
+            f"الدخول `{result.get('entry_price', 0):.6g}` | "
+            f"TP1 `{result.get('tp1_price', 0):.6g}` | "
+            f"TP2 `{result.get('tp2_price', 0):.6g}` | "
+            f"TP3 `{result.get('tp3_price', 0):.6g}`\n"
+            f"SL `{result.get('sl_price', 0):.6g}`",
+            parse_mode="Markdown",
+            reply_markup=pf_keyboard(pf.id, pf.is_running),
+        )
+    finally:
+        db.close()
+
+
 async def _do_start(query, tid, pf_id):
     db = SessionLocal()
     try:
@@ -1164,8 +1499,20 @@ async def _do_stop(query, tid, pf_id):
             })
         get_reb().cancel_tp_orders(tp_orders)
 
-        if coins:
-            get_reb().stop_portfolio(coins, dry_run=False)
+        stop_result = get_reb().stop_portfolio(coins, dry_run=False) if coins else {"executed": []}
+        for sold in stop_result.get("executed", []):
+            symbol = str(sold.get("symbol", "")).split("/")[0]
+            coin = next((c for c in p.coins if c.symbol == symbol), None)
+            amount = float(sold.get("amount") or 0)
+            usdt = float(sold.get("usdt") or 0)
+            exit_price = usdt / amount if amount > 0 else 0.0
+            if coin and amount > 0 and float(coin.entry_price or 0) > 0:
+                record_trade_event(
+                    db, tid, p.id, coin.id, symbol, "manual_stop",
+                    coin.entry_price, exit_price, amount,
+                    (exit_price - coin.entry_price) * amount,
+                    details="Manual portfolio stop",
+                )
 
         from database import reset_coin_positions
         reset_coin_positions(db, pf_id)
@@ -1443,16 +1790,30 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
             tid = pf.telegram_id if pf else config.ADMIN_TELEGRAM_ID
 
             if act["action"] == "tp1_hit":
+                remaining_before = float(coin.remaining_amount or coin.amount or 0)
+                filled_amount = float(act.get("filled_amount") or 0)
+                if filled_amount <= 0:
+                    filled_amount = remaining_before * 0.40
+                filled_amount = min(filled_amount, remaining_before)
+                fill_price = float(act.get("fill_price") or act.get("price") or coin.tp1_price or 0)
+                pnl = (fill_price - float(coin.entry_price or 0)) * filled_amount
+                record_trade_event(
+                    db, tid, pf.id, coin.id, symbol, "tp1",
+                    coin.entry_price, fill_price, filled_amount, pnl,
+                    details="TP1 filled",
+                )
                 update_coin_position(
                     db, coin.id,
                     position_status="tp1_hit",
-                    current_sl_price=act["new_sl"],
+                    # Break-even is the original entry, not TP1.
+                    current_sl_price=coin.entry_price,
+                    remaining_amount=max(0.0, remaining_before - filled_amount),
                     tp1_order_id=None,
                 )
                 msg = (
                     f"🎯 *تحقق الهدف 1* — `{symbol}`\n"
                     f"السعر: `{act['price']:.6g}`\n"
-                    f"تم رفع الاستوب إلى `{act['new_sl']:.6g}`\n"
+                    f"تم نقل الاستوب إلى سعر الدخول `{coin.entry_price:.6g}`\n"
                     f"المحفظة: *{pf.name if pf else '—'}*"
                 )
                 try:
@@ -1461,10 +1822,23 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     pass
 
             elif act["action"] == "tp2_hit":
+                remaining_before = float(coin.remaining_amount or coin.amount or 0)
+                filled_amount = float(act.get("filled_amount") or 0)
+                if filled_amount <= 0:
+                    filled_amount = remaining_before * 0.50
+                filled_amount = min(filled_amount, remaining_before)
+                fill_price = float(act.get("fill_price") or act.get("price") or coin.tp2_price or 0)
+                pnl = (fill_price - float(coin.entry_price or 0)) * filled_amount
+                record_trade_event(
+                    db, tid, pf.id, coin.id, symbol, "tp2",
+                    coin.entry_price, fill_price, filled_amount, pnl,
+                    details="TP2 filled",
+                )
                 update_coin_position(
                     db, coin.id,
                     position_status="tp2_hit",
                     current_sl_price=act["new_sl"],
+                    remaining_amount=max(0.0, remaining_before - filled_amount),
                     tp2_order_id=None,
                 )
                 msg = (
@@ -1479,9 +1853,22 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     pass
 
             elif act["action"] == "tp3_hit":
+                remaining_before = float(coin.remaining_amount or coin.amount or 0)
+                filled_amount = float(act.get("filled_amount") or remaining_before)
+                filled_amount = min(filled_amount, remaining_before)
+                fill_price = float(act.get("fill_price") or act.get("price") or coin.tp3_price or 0)
+                pnl = (fill_price - float(coin.entry_price or 0)) * filled_amount
+                record_trade_event(
+                    db, tid, pf.id, coin.id, symbol, "tp3",
+                    coin.entry_price, fill_price, filled_amount, pnl,
+                    details="TP3 filled",
+                )
                 update_coin_position(
                     db, coin.id,
-                    position_status="tp3_hit",
+                    position_status="closed",
+                    current_sl_price=0.0,
+                    remaining_amount=max(0.0, remaining_before - filled_amount),
+                    amount=max(0.0, remaining_before - filled_amount),
                     tp3_order_id=None,
                 )
                 msg = (
@@ -1597,20 +1984,51 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                         pass
 
             elif act["action"] == "sl_hit_sold":
+                exit_price = float(act.get("price") or 0)
+                stopped_amount = float(act.get("amount") or 0)
+                entry_price = float(coin.entry_price or 0)
+                pnl = (exit_price - entry_price) * stopped_amount
+                reentry_available = bool(act.get("reentry_available"))
+                record_trade_event(
+                    db, tid, pf.id, coin.id, symbol, "stop_loss",
+                    entry_price, exit_price, stopped_amount, pnl,
+                    reentry_available=reentry_available,
+                    details="Stop loss filled",
+                )
                 update_coin_position(
                     db, coin.id,
-                    position_status="closed",
+                    position_status="stopped",
+                    current_sl_price=0.0,
                     tp_order_id=None,
+                    tp1_order_id=None,
+                    tp2_order_id=None,
+                    tp3_order_id=None,
                     amount=0.0,
+                    remaining_amount=0.0,
+                    reentry_price=act.get("reentry_price", 0.0),
+                    reentry_touched=False,
+                    reentry_used=not reentry_available,
                 )
                 raised = " (بعد رفع الاستوب)" if act.get("was_raised") else ""
                 msg = (
                     f"🛡 *ضرب الاستوب{raised}* — `{symbol}`\n"
                     f"تم البيع فوراً بسعر السوق ≈ `{act['price']:.6g}`\n"
+                    f"النتيجة: `{pnl:+.2f}` USDT\n"
+                    f"{'يمكنك اختيار إعادة الدخول من زر الاستوبات.' if reentry_available else 'لا توجد إعادة دخول متاحة لهذه الدورة.'}\n"
                     f"المحفظة: *{pf.name if pf else '—'}*"
                 )
                 try:
-                    await context.bot.send_message(tid, msg, parse_mode="Markdown")
+                    await context.bot.send_message(
+                        tid,
+                        msg,
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton(
+                                "🔄 عرض العملات وإعادة الدخول",
+                                callback_data=f"stopped_{pf.id}",
+                            )]
+                        ]) if reentry_available else None,
+                    )
                 except Exception:
                     pass
 

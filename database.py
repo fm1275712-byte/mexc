@@ -98,6 +98,26 @@ class PortfolioCoin(Base):
     portfolio = relationship("Portfolio", back_populates="coins")
 
 
+class PortfolioTrade(Base):
+    """سجل خروج فعلي من مركز، ويُستخدم للإحصائيات وإعادة الدخول اليدوية."""
+    __tablename__ = "portfolio_trades"
+
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(BigInteger, index=True, nullable=False)
+    portfolio_id = Column(Integer, index=True, nullable=False)
+    portfolio_coin_id = Column(Integer, index=True, nullable=True)
+    symbol = Column(String(20), nullable=False)
+    event_type = Column(String(30), nullable=False)  # tp1 | tp2 | tp3 | stop_loss | reentry
+    entry_price = Column(Float, default=0.0)
+    exit_price = Column(Float, default=0.0)
+    amount = Column(Float, default=0.0)
+    realized_pnl = Column(Float, default=0.0)
+    reentry_available = Column(Boolean, default=False)
+    reentry_used = Column(Boolean, default=False)
+    details = Column(String(500), default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class RebalanceLog(Base):
     __tablename__ = "rebalance_logs"
 
@@ -359,6 +379,66 @@ def reset_coin_positions(db, portfolio_id: int):
         c.reentry_used = False
         c.reentry_touched = False
     db.commit()
+
+
+def record_trade_event(
+    db,
+    telegram_id: int,
+    portfolio_id: int,
+    portfolio_coin_id: int,
+    symbol: str,
+    event_type: str,
+    entry_price: float,
+    exit_price: float,
+    amount: float,
+    realized_pnl: float,
+    reentry_available: bool = False,
+    details: str = "",
+):
+    event = PortfolioTrade(
+        telegram_id=telegram_id,
+        portfolio_id=portfolio_id,
+        portfolio_coin_id=portfolio_coin_id,
+        symbol=symbol,
+        event_type=event_type,
+        entry_price=float(entry_price or 0),
+        exit_price=float(exit_price or 0),
+        amount=float(amount or 0),
+        realized_pnl=float(realized_pnl or 0),
+        reentry_available=reentry_available,
+        reentry_used=False,
+        details=(details or "")[:500],
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    return event
+
+
+def get_trade_event(db, event_id: int, telegram_id: int = None):
+    q = db.query(PortfolioTrade).filter(PortfolioTrade.id == event_id)
+    if telegram_id:
+        q = q.filter(PortfolioTrade.telegram_id == telegram_id)
+    return q.first()
+
+
+def get_reentry_candidates(db, portfolio_id: int, telegram_id: int = None):
+    q = db.query(PortfolioTrade).filter(
+        PortfolioTrade.portfolio_id == portfolio_id,
+        PortfolioTrade.event_type == "stop_loss",
+        PortfolioTrade.reentry_available == True,
+        PortfolioTrade.reentry_used == False,
+    )
+    if telegram_id:
+        q = q.filter(PortfolioTrade.telegram_id == telegram_id)
+    return q.order_by(PortfolioTrade.created_at.desc()).all()
+
+
+def get_portfolio_trade_events(db, portfolio_id: int, telegram_id: int = None):
+    q = db.query(PortfolioTrade).filter(PortfolioTrade.portfolio_id == portfolio_id)
+    if telegram_id:
+        q = q.filter(PortfolioTrade.telegram_id == telegram_id)
+    return q.order_by(PortfolioTrade.created_at.desc()).all()
 
 
 def get_open_positions(db, telegram_id: int = None):

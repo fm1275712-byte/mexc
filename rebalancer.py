@@ -121,9 +121,16 @@ class Rebalancer:
         stop_loss_pct: float,
         tp1_sell_pct: float = 40.0,
         tp2_sell_pct: float = 30.0,
+        skip_stages: Optional[List[str]] = None,
     ) -> List[Dict]:
-        """Place 3 Limit Sell orders (partial) on MEXC + initial SL."""
+        """Place the remaining TP limit orders on MEXC + calculate the SL.
+
+        ``skip_stages`` is used when a target was already filled and the
+        portfolio's targets are being refreshed. It prevents recreating a
+        sell order for a target that has already been taken.
+        """
         results = []
+        skipped = set(skip_stages or [])
         for item in coins_data:
             symbol = item["symbol"]
             amount = float(item.get("amount") or 0)
@@ -141,17 +148,17 @@ class Rebalancer:
             tp3 = entry * (1 + tp3_pct / 100.0)
             sl = entry * (1 - stop_loss_pct / 100.0)
 
-            a1 = amount * (tp1_sell_pct / 100.0)
-            a2 = amount * (tp2_sell_pct / 100.0)
-            a3 = max(0.0, amount - a1 - a2)
-
             orders = {"tp1_order_id": None, "tp2_order_id": None, "tp3_order_id": None}
             errors = []
-            for key, qty, price in [
-                ("tp1_order_id", a1, tp1),
-                ("tp2_order_id", a2, tp2),
-                ("tp3_order_id", a3, tp3),
-            ]:
+            planned = [
+                ("tp1", "tp1_order_id", tp1, max(0.0, tp1_sell_pct)),
+                ("tp2", "tp2_order_id", tp2, max(0.0, tp2_sell_pct)),
+                ("tp3", "tp3_order_id", tp3, max(0.0, 100.0 - tp1_sell_pct - tp2_sell_pct)),
+            ]
+            active = [stage for stage in planned if stage[0] not in skipped and stage[3] > 0]
+            active_weight = sum(stage[3] for stage in active)
+            for stage, key, price, weight in active:
+                qty = amount * (weight / active_weight) if active_weight > 0 else 0.0
                 if qty <= 0:
                     continue
                 try:
@@ -190,29 +197,38 @@ class Rebalancer:
                         pass
 
     def _order_filled(self, order_id: Optional[str], symbol: str) -> bool:
+        return self._filled_order_info(order_id, symbol) is not None
+
+    def _filled_order_info(self, order_id: Optional[str], symbol: str) -> Optional[Dict[str, float]]:
         if not order_id:
-            return False
+            return None
         try:
             order = self.client.fetch_order(order_id, symbol)
             if not order:
-                return False
+                return None
             st = (order.get("status") or "").lower()
             # A cancelled TP order is not a filled target. Treating it as
             # filled raises the stop to an untouched TP price and can trigger
             # an incorrect sell/re-entry cycle.
             if st in ("canceled", "cancelled", "rejected", "expired"):
-                return False
+                return None
             if st not in ("closed", "filled"):
-                return False
+                return None
             filled = order.get("filled")
-            if filled is not None:
-                try:
-                    return float(filled) > 0
-                except (TypeError, ValueError):
-                    return False
-            return True
+            try:
+                filled_amount = float(filled or 0)
+            except (TypeError, ValueError):
+                filled_amount = 0.0
+            if filled is not None and filled_amount <= 0:
+                return None
+            average = order.get("average") or order.get("price") or 0
+            try:
+                average_price = float(average or 0)
+            except (TypeError, ValueError):
+                average_price = 0.0
+            return {"filled": filled_amount, "average": average_price}
         except Exception:
-            return False
+            return None
 
     def check_and_manage_positions(self, positions: List[Any]) -> List[Dict]:
         """
@@ -273,24 +289,39 @@ class Rebalancer:
                 continue
 
             # ----- normal TP detection -----
-            if status == "open" and self._order_filled(getattr(coin, "tp1_order_id", None), symbol):
+            tp1_fill = self._filled_order_info(getattr(coin, "tp1_order_id", None), symbol)
+            if status == "open" and tp1_fill:
                 actions.append({
                     "symbol": symbol,
                     "action": "tp1_hit",
-                    "new_sl": coin.tp1_price,
+                    # TP1 must move the stop to the original entry price
+                    # (break-even), not to the TP1 price.
+                    "new_sl": coin.entry_price,
                     "price": price,
+                    "filled_amount": tp1_fill.get("filled", 0.0),
+                    "fill_price": tp1_fill.get("average") or coin.tp1_price,
                 })
                 continue
-            if status in ("open", "tp1_hit") and self._order_filled(getattr(coin, "tp2_order_id", None), symbol):
+            tp2_fill = self._filled_order_info(getattr(coin, "tp2_order_id", None), symbol)
+            if status in ("open", "tp1_hit") and tp2_fill:
                 actions.append({
                     "symbol": symbol,
                     "action": "tp2_hit",
                     "new_sl": coin.tp2_price,
                     "price": price,
+                    "filled_amount": tp2_fill.get("filled", 0.0),
+                    "fill_price": tp2_fill.get("average") or coin.tp2_price,
                 })
                 continue
-            if status in ("open", "tp1_hit", "tp2_hit") and self._order_filled(getattr(coin, "tp3_order_id", None), symbol):
-                actions.append({"symbol": symbol, "action": "tp3_hit", "price": price})
+            tp3_fill = self._filled_order_info(getattr(coin, "tp3_order_id", None), symbol)
+            if status in ("open", "tp1_hit", "tp2_hit") and tp3_fill:
+                actions.append({
+                    "symbol": symbol,
+                    "action": "tp3_hit",
+                    "price": price,
+                    "filled_amount": tp3_fill.get("filled", 0.0),
+                    "fill_price": tp3_fill.get("average") or coin.tp3_price,
+                })
                 continue
 
             # ----- stop loss -----
@@ -324,30 +355,19 @@ class Rebalancer:
 
                 was_raised = status in ("tp1_hit", "tp2_hit", "tp3_hit", "tp_hit")
                 orig_sl = float(getattr(coin, "original_sl_price", 0) or 0)
-                # After any stop hit, wait for the original SL zone and a
-                # bounce before one re-entry. This also covers a first-time
-                # hit on the original stop, not only a raised stop after TP.
-                if orig_sl > 0 and not getattr(coin, "reentry_used", False):
-                    actions.append({
-                        "symbol": symbol,
-                        "action": "sl_hit_wait_reentry",
-                        "sl": sl,
-                        "price": price,
-                        "amount": amount,
-                        "sold": sold,
-                        "was_raised": was_raised,
-                        "reentry_price": orig_sl,
-                    })
-                else:
-                    actions.append({
-                        "symbol": symbol,
-                        "action": "sl_hit_sold",
-                        "sl": sl,
-                        "price": price,
-                        "amount": amount,
-                        "sold": sold,
-                        "was_raised": was_raised,
-                    })
+                # A stop creates a manual re-entry candidate. The user must
+                # explicitly choose whether to buy this coin again.
+                actions.append({
+                    "symbol": symbol,
+                    "action": "sl_hit_sold",
+                    "sl": sl,
+                    "price": price,
+                    "amount": amount,
+                    "sold": sold,
+                    "was_raised": was_raised,
+                    "reentry_price": orig_sl,
+                    "reentry_available": bool(orig_sl > 0 and not getattr(coin, "reentry_used", False)),
+                })
         return actions
 
     def reentry_buy_and_place_tp(
