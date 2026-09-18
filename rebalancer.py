@@ -197,7 +197,20 @@ class Rebalancer:
             if not order:
                 return False
             st = (order.get("status") or "").lower()
-            return st in ("closed", "filled", "canceled", "cancelled")
+            # A cancelled TP order is not a filled target. Treating it as
+            # filled raises the stop to an untouched TP price and can trigger
+            # an incorrect sell/re-entry cycle.
+            if st in ("canceled", "cancelled", "rejected", "expired"):
+                return False
+            if st not in ("closed", "filled"):
+                return False
+            filled = order.get("filled")
+            if filled is not None:
+                try:
+                    return float(filled) > 0
+                except (TypeError, ValueError):
+                    return False
+            return True
         except Exception:
             return False
 
