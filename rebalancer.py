@@ -194,31 +194,40 @@ class Rebalancer:
             return False
         try:
             order = self.client.fetch_order(order_id, symbol)
-            if order and order.get("status") in ("closed", "filled"):
-                return True
-            open_orders = self.client.fetch_open_orders(symbol)
-            return not any(o.get("id") == order_id for o in open_orders)
+            if not order:
+                return False
+            st = (order.get("status") or "").lower()
+            return st in ("closed", "filled", "canceled", "cancelled")
         except Exception:
             return False
 
     def check_and_manage_positions(self, positions: List[Any]) -> List[Dict]:
         """
-        Multi-TP + smart re-entry:
-        - TP1/2/3 hits raise SL stepwise
-        - Raised SL hit after TP → sell + wait for re-entry at original SL
-        - Original SL touch then +1% bounce → buy once, new cycle
-        - Initial SL hit before any TP → sell and close (no re-entry)
+        Multi-TP + smart re-entry (optimized: one price batch per cycle).
         """
         actions = []
-        for coin in positions:
+        active = [
+            c for c in positions
+            if (c.position_status or "idle") in (
+                "open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit", "waiting_reentry"
+            )
+        ]
+        if not active:
+            return actions
+        symbols = list({c.symbol for c in active})
+        try:
+            prices = self.client.get_all_prices(symbols)
+        except Exception:
+            prices = {}
+        for coin in active:
             symbol = coin.symbol
             status = coin.position_status or "idle"
-            if status not in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit", "waiting_reentry"):
-                continue
-            try:
-                price = self.client.get_ticker_price(f"{symbol}/{self.quote}")
-            except Exception:
-                continue
+            price = float(prices.get(symbol) or 0)
+            if price <= 0:
+                try:
+                    price = self.client.get_ticker_price(f"{symbol}/{self.quote}")
+                except Exception:
+                    continue
             if price <= 0:
                 continue
 

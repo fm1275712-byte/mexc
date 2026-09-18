@@ -684,7 +684,11 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    # Answer immediately so Telegram doesn't timeout (query expires ~seconds)
+    try:
+        await query.answer()
+    except Exception:
+        pass
     if not await ensure_admin(update):
         return
     data = query.data or ""
@@ -1418,13 +1422,18 @@ async def edit_src_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
-    """Background job: check open positions every ~25s for TP fill / SL hit."""
+    """Background job: check open positions for TP fill / SL hit / re-entry."""
+    import asyncio
     db = SessionLocal()
     try:
         positions = get_open_positions(db)
         if not positions:
             return
-        actions = get_reb().check_and_manage_positions(positions)
+        # Run sync CCXT work off the event loop so Telegram stays responsive
+        loop = asyncio.get_event_loop()
+        actions = await loop.run_in_executor(
+            None, lambda: get_reb().check_and_manage_positions(positions)
+        )
         for act in actions:
             symbol = act["symbol"]
             coin = next((c for c in positions if c.symbol == symbol), None)
@@ -1539,8 +1548,12 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 sl_pct = _pct(getattr(pf, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
                 n_coins = max(1, len(pf.coins) if pf else 1)
                 usdt = (pf.investment_usdt if pf else 20) / n_coins
-                buy_res = get_reb().reentry_buy_and_place_tp(
-                    symbol, usdt, tp1, tp2, tp3, sl_pct, s1, s2
+                loop = asyncio.get_event_loop()
+                buy_res = await loop.run_in_executor(
+                    None,
+                    lambda: get_reb().reentry_buy_and_place_tp(
+                        symbol, usdt, tp1, tp2, tp3, sl_pct, s1, s2
+                    ),
                 )
                 if buy_res.get("error"):
                     try:
@@ -1629,8 +1642,13 @@ def main():
 
     # Cloud monitor for TP/SL every 25 seconds
     if app.job_queue:
-        app.job_queue.run_repeating(monitor_positions_job, interval=25, first=10)
-        logger.info("Position monitor job scheduled (every 25s)")
+        app.job_queue.run_repeating(
+            monitor_positions_job,
+            interval=45,
+            first=15,
+            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
+        )
+        logger.info("Position monitor job scheduled (every 45s)")
     else:
         logger.warning("JobQueue not available — install python-telegram-bot[job-queue]")
 
