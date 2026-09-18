@@ -434,6 +434,22 @@ def get_reentry_candidates(db, portfolio_id: int, telegram_id: int = None):
     return q.order_by(PortfolioTrade.created_at.desc()).all()
 
 
+def mark_reentry_events_used(db, portfolio_id: int, symbol: str):
+    """Consume outstanding manual stop-loss re-entry offers for a coin."""
+    events = db.query(PortfolioTrade).filter(
+        PortfolioTrade.portfolio_id == portfolio_id,
+        PortfolioTrade.symbol == symbol.upper(),
+        PortfolioTrade.event_type == "stop_loss",
+        PortfolioTrade.reentry_available == True,
+        PortfolioTrade.reentry_used == False,
+    ).all()
+    for event in events:
+        event.reentry_available = False
+        event.reentry_used = True
+    db.commit()
+    return len(events)
+
+
 def get_portfolio_trade_events(db, portfolio_id: int, telegram_id: int = None):
     q = db.query(PortfolioTrade).filter(PortfolioTrade.portfolio_id == portfolio_id)
     if telegram_id:

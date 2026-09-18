@@ -399,4 +399,10 @@ class Rebalancer:
         )
         if placed:
             result.update(placed[0])
+            # The market buy already succeeded. A failure on one or more TP
+            # orders is a warning, not a failed re-entry; callers must persist
+            # the open position so a later wallet scan cannot buy it twice.
+            if result.get("error"):
+                result["tp_warning"] = result["error"]
+                result["error"] = None
         return result

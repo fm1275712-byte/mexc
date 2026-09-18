@@ -27,7 +27,7 @@ from database import (
     update_signal_source, delete_signal_source, log_signal, parse_portfolio_ids,
     SignalLog, update_coin_position, reset_coin_positions, get_open_positions,
     record_trade_event, get_trade_event, get_reentry_candidates,
-    get_portfolio_trade_events,
+    get_portfolio_trade_events, mark_reentry_events_used,
 )
 from mexc_client import MexcClient
 from rebalancer import Rebalancer
@@ -101,12 +101,40 @@ def pf_keyboard(pf_id: int, is_running: bool):
         InlineKeyboardButton("🛑 الاستوبات / إعادة الدخول", callback_data=f"stopped_{pf_id}"),
         InlineKeyboardButton("📊 إحصائيات الربح والخسارة", callback_data=f"stats_{pf_id}"),
     ])
+    rows.append([InlineKeyboardButton("🔎 فحص العملات الناقصة", callback_data=f"missing_{pf_id}")])
     rows.append([
         InlineKeyboardButton("➕ عملة", callback_data=f"addcoin_{pf_id}"),
         InlineKeyboardButton("➖ عملة", callback_data=f"removecoin_{pf_id}"),
     ])
     rows.append([InlineKeyboardButton("🗑 حذف المحفظة", callback_data=f"close_{pf_id}")])
     rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="list_pf")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _missing_selection_key(pf_id: int) -> str:
+    return f"missing_reentry_selection_{pf_id}"
+
+
+def _missing_reentry_keyboard(pf_id: int, missing_symbols, selected, allow_selection=True):
+    rows = []
+    if allow_selection:
+        for symbol in missing_symbols:
+            marker = "✅" if symbol in selected else "⬜"
+            rows.append([
+                InlineKeyboardButton(
+                    f"{marker} {symbol}",
+                    callback_data=f"missing_toggle_{pf_id}_{symbol}",
+                )
+            ])
+    if selected and allow_selection:
+        rows.append([
+            InlineKeyboardButton(
+                f"✅ تأكيد إعادة الدخول ({len(selected)})",
+                callback_data=f"missing_confirm_{pf_id}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("🔄 إعادة الفحص", callback_data=f"missing_{pf_id}")])
+    rows.append([InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -818,6 +846,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.close()
         return
 
+    if data.startswith("missing_toggle_"):
+        parts = data.split("_", 3)
+        if len(parts) != 4:
+            await query.edit_message_text("طلب غير صالح.", reply_markup=main_menu_keyboard())
+            return
+        await _show_missing_reentry(query, context, tid, int(parts[2]), parts[3])
+        return
+
+    if data.startswith("missing_confirm_"):
+        await _do_missing_reentry(query, context, tid, int(data.split("_")[2]))
+        return
+
+    if data.startswith("missing_"):
+        await _show_missing_reentry(query, context, tid, int(data.split("_")[1]))
+        return
+
     if data.startswith("stopped_"):
         pf_id = int(data.split("_")[1])
         db = SessionLocal()
@@ -1291,6 +1335,315 @@ async def _do_refresh_tpsl(query, tid, pf_id):
             reply_markup=pf_keyboard(pf_id, True),
         )
     finally:
+        db.close()
+
+
+async def _show_missing_reentry(query, context, tid, pf_id, toggle_symbol=None):
+    """Show missing portfolio coins and let the user build a buy selection."""
+    import asyncio
+
+    db = SessionLocal()
+    try:
+        pf = get_portfolio(db, pf_id, tid)
+        if not pf:
+            await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
+            return
+
+        symbols = [c.symbol for c in pf.coins]
+        if not symbols:
+            await query.edit_message_text(
+                "المحفظة لا تحتوي على عملات.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+            return
+
+        loop = asyncio.get_event_loop()
+        try:
+            presence = await loop.run_in_executor(
+                None, lambda: get_mexc().get_portfolio_presence(symbols)
+            )
+        except Exception as exc:
+            logger.exception("Portfolio missing-coin scan failed")
+            await query.edit_message_text(
+                "⚠️ تعذر فحص الرصيد من MEXC.\n"
+                "لم يتم اعتبار أي عملة ناقصة ولم يتم تنفيذ أي شراء.\n\n"
+                f"الخطأ: `{exc}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data=f"missing_{pf_id}")],
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+            return
+
+        missing_symbols = [
+            symbol for symbol in symbols
+            if not presence.get(symbol, {}).get("present", False)
+        ]
+        key = _missing_selection_key(pf_id)
+        selected = set(context.user_data.get(key, []))
+        selected.intersection_update(missing_symbols)
+        if not pf.is_running:
+            selected.clear()
+            context.user_data.pop(key, None)
+
+        if toggle_symbol and pf.is_running:
+            toggle_symbol = toggle_symbol.upper()
+            if toggle_symbol in missing_symbols:
+                if toggle_symbol in selected:
+                    selected.remove(toggle_symbol)
+                else:
+                    selected.add(toggle_symbol)
+            context.user_data[key] = sorted(selected)
+
+        if not missing_symbols:
+            context.user_data.pop(key, None)
+            await query.edit_message_text(
+                f"✅ فحص *{pf.name}* مكتمل.\n"
+                f"كل العملات المسجلة ({len(symbols)}) موجودة في الرصيد الكلي.\n"
+                "تم احتساب العملات الموجودة داخل أوامر البيع المفتوحة.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+            return
+
+        present_count = len(symbols) - len(missing_symbols)
+        lines = [
+            f"🔎 *فحص العملات — {pf.name}*",
+            "",
+            f"المسجلة: `{len(symbols)}` | الموجودة: `{present_count}` | الناقصة: `{len(missing_symbols)}`",
+            "",
+            (
+                "اختر العملات التي تريد إعادة دخولها."
+                if pf.is_running
+                else "⚠️ المحفظة متوقفة؛ الفحص متاح للعرض فقط، ولن يظهر خيار شراء."
+            ),
+            "لا يوجد شراء عند الاختيار؛ الشراء لا يبدأ إلا بعد زر التأكيد.",
+            "",
+            "العملة المحددة: " + (
+                ", ".join(f"`{symbol}`" for symbol in sorted(selected))
+                if selected else "—"
+            ),
+        ]
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=_missing_reentry_keyboard(
+                pf_id, missing_symbols, selected, allow_selection=pf.is_running
+            ),
+        )
+    finally:
+        db.close()
+
+
+async def _do_missing_reentry(query, context, tid, pf_id):
+    """Re-check and buy only the coins explicitly confirmed by the user."""
+    import asyncio
+
+    key = _missing_selection_key(pf_id)
+    if context.user_data.get(f"{key}_in_progress"):
+        await query.edit_message_text("⏳ إعادة الدخول قيد التنفيذ بالفعل.")
+        return
+
+    selected = set(context.user_data.get(key, []))
+    if not selected:
+        await query.edit_message_text(
+            "اختر عملة واحدة على الأقل أولاً.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔎 فحص العملات الناقصة", callback_data=f"missing_{pf_id}")],
+                [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+            ]),
+        )
+        return
+
+    db = SessionLocal()
+    try:
+        pf = get_portfolio(db, pf_id, tid)
+        if not pf:
+            await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
+            return
+        if not pf.is_running:
+            await query.edit_message_text(
+                "⚠️ المحفظة أصبحت متوقفة. لم يتم تنفيذ أي شراء.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+            return
+
+        coin_map = {coin.symbol.upper(): coin for coin in pf.coins}
+        selected = {symbol.upper() for symbol in selected if symbol.upper() in coin_map}
+        if not selected:
+            context.user_data.pop(key, None)
+            await query.edit_message_text(
+                "لم تعد هناك عملات صالحة لإعادة الدخول.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+            return
+
+        # Re-check immediately before placing any order. A balance appearing
+        # after the first scan must remove that coin from the buy list.
+        loop = asyncio.get_event_loop()
+        try:
+            presence = await loop.run_in_executor(
+                None, lambda: get_mexc().get_portfolio_presence(list(coin_map))
+            )
+        except Exception as exc:
+            logger.exception("Final portfolio missing-coin scan failed")
+            await query.edit_message_text(
+                "⚠️ تعذر إعادة فحص الرصيد قبل التنفيذ.\n"
+                "تم إلغاء العملية بالكامل ولم يتم شراء أي عملة.\n\n"
+                f"الخطأ: `{exc}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 إعادة الفحص", callback_data=f"missing_{pf_id}")],
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+            return
+
+        no_longer_missing = {
+            symbol for symbol in selected
+            if presence.get(symbol, {}).get("present", False)
+        }
+        selected -= no_longer_missing
+        if not selected:
+            context.user_data.pop(key, None)
+            await query.edit_message_text(
+                "ℹ️ العملات المحددة أصبحت موجودة بالفعل في الرصيد.\n"
+                "تم إلغاء الشراء.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+            return
+
+        per_coin_usdt = max(
+            5.0,
+            float(pf.investment_usdt or 0) / max(1, len(pf.coins)),
+        )
+        required_usdt = per_coin_usdt * len(selected)
+        try:
+            free_usdt = await loop.run_in_executor(None, get_mexc().get_free_usdt)
+        except Exception as exc:
+            logger.exception("Free USDT preflight failed")
+            await query.edit_message_text(
+                "⚠️ تعذر التحقق من رصيد USDT الحر.\n"
+                "تم إلغاء العملية ولم يتم شراء أي عملة.\n\n"
+                f"الخطأ: `{exc}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 إعادة الفحص", callback_data=f"missing_{pf_id}")],
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+            return
+        if free_usdt < required_usdt:
+            await query.edit_message_text(
+                f"⚠️ رصيد USDT الحر غير كافٍ.\n"
+                f"المتاح: `{free_usdt:.2f}` USDT\n"
+                f"المطلوب تقريباً: `{required_usdt:.2f}` USDT\n\n"
+                "تم إلغاء العملية ولم يتم شراء أي عملة.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+            return
+
+        context.user_data[f"{key}_in_progress"] = True
+        selected_symbols = sorted(selected)
+        await query.edit_message_text(
+            "⏳ تم التأكيد.\n"
+            f"سيتم تنفيذ إعادة دخول لـ `{len(selected_symbols)}` عملة فقط:\n"
+            + ", ".join(f"`{symbol}`" for symbol in selected_symbols),
+            parse_mode="Markdown",
+        )
+
+        user = get_or_create_user(db, tid)
+
+        def pct(pf_val, user_val, default):
+            if pf_val is not None and float(pf_val) > 0:
+                return float(pf_val)
+            if user_val is not None and float(user_val) > 0:
+                return float(user_val)
+            return default
+
+        tp1 = pct(getattr(pf, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
+        tp2 = pct(getattr(pf, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
+        tp3 = pct(getattr(pf, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
+        s1 = pct(getattr(pf, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
+        s2 = pct(getattr(pf, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 30.0)
+        sl_pct = pct(getattr(pf, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
+
+        succeeded = []
+        errors = []
+        for symbol in selected_symbols:
+            coin = coin_map[symbol]
+            try:
+                result = await loop.run_in_executor(
+                    None,
+                    lambda symbol=symbol: get_reb().reentry_buy_and_place_tp(
+                        symbol, per_coin_usdt, tp1, tp2, tp3, sl_pct, s1, s2
+                    ),
+                )
+            except Exception as exc:
+                logger.exception("Missing-coin re-entry failed for %s", symbol)
+                errors.append(f"`{symbol}`: {exc}")
+                continue
+
+            if result.get("error"):
+                errors.append(f"`{symbol}`: {result['error']}")
+                continue
+
+            update_coin_position(
+                db, coin.id,
+                entry_price=result.get("entry_price", 0),
+                tp1_price=result.get("tp1_price", 0),
+                tp2_price=result.get("tp2_price", 0),
+                tp3_price=result.get("tp3_price", 0),
+                tp_price=result.get("tp1_price", 0),
+                current_sl_price=result.get("sl_price", 0),
+                original_sl_price=result.get("original_sl_price") or result.get("sl_price", 0),
+                amount=result.get("amount", 0),
+                remaining_amount=result.get("amount", 0),
+                tp1_order_id=result.get("tp1_order_id"),
+                tp2_order_id=result.get("tp2_order_id"),
+                tp3_order_id=result.get("tp3_order_id"),
+                position_status="open",
+                reentry_used=True,
+                reentry_touched=False,
+                reentry_price=0.0,
+            )
+            mark_reentry_events_used(db, pf.id, symbol)
+            log_action(db, tid, "missing_coin_reentry", f"Re-entry for missing {symbol}", True, pf.id)
+            success_line = f"`{symbol}` عند `{float(result.get('entry_price') or 0):.6g}`"
+            if result.get("tp_warning"):
+                success_line += f" (تحذير TP: {result['tp_warning']})"
+            succeeded.append(success_line)
+
+        context.user_data.pop(key, None)
+        lines = ["🔄 *نتيجة إعادة الدخول*"]
+        if succeeded:
+            lines.append("\n✅ تم الشراء:")
+            lines.extend(f"• {item}" for item in succeeded)
+        if errors:
+            lines.append("\n⚠️ لم يتم الشراء:")
+            lines.extend(f"• {item}" for item in errors)
+        lines.append("\nلم يتم تنفيذ أي عملة لم تكن محددة في شاشة التأكيد.")
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=pf_keyboard(pf.id, pf.is_running),
+        )
+    finally:
+        context.user_data.pop(f"{key}_in_progress", None)
         db.close()
 
 

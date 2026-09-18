@@ -25,6 +25,42 @@ class MexcClient:
                 free[asset] = float(amount)
         return free
 
+    def get_total_balance(self) -> Dict[str, float]:
+        """Return total balances, including amounts locked in open orders."""
+        balance = self.exchange.fetch_balance()
+        totals = balance.get("total") or {}
+        free = balance.get("free") or {}
+        result = {}
+        for asset in set(totals) | set(free):
+            amount = totals.get(asset)
+            if amount is None:
+                amount = free.get(asset)
+            try:
+                value = float(amount or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                result[asset] = value
+        return result
+
+    def get_portfolio_presence(self, symbols: List[str]) -> Dict[str, Dict[str, float]]:
+        """Return whether each configured coin exists in the wallet.
+
+        Total balance is intentional here: a coin locked in an open sell order
+        is still owned and must not be offered for re-entry.
+        """
+        normalized = [str(symbol).upper().strip() for symbol in symbols if symbol]
+        balances = self.get_total_balance()
+        prices = self.get_all_prices(normalized)
+        return {
+            symbol: {
+                "amount": float(balances.get(symbol, 0.0)),
+                "price": float(prices.get(symbol, 0.0)),
+                "present": float(balances.get(symbol, 0.0)) > 0,
+            }
+            for symbol in normalized
+        }
+
     def get_free_usdt(self) -> float:
         bal = self.get_balance()
         return float(bal.get(self.quote, 0.0))
