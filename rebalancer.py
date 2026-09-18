@@ -1,5 +1,8 @@
-from typing import Dict, List
+from typing import Dict, List, Optional, Any
 from mexc_client import MexcClient
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Rebalancer:
@@ -12,6 +15,166 @@ class Rebalancer:
             return {}
         pct = 100.0 / len(coins)
         return {c: pct for c in coins}
+
+    def place_tp_orders(
+        self,
+        coins_data: List[Dict[str, Any]],
+        take_profit_pct: float,
+        stop_loss_pct: float,
+    ) -> List[Dict]:
+        """
+        After buying, place Limit Sell (TP) on MEXC and compute SL.
+        coins_data: list of {symbol, amount, entry_price}  (or we fetch amount/price)
+        Returns list of results per coin.
+        """
+        results = []
+        for item in coins_data:
+            symbol = item["symbol"]
+            amount = float(item.get("amount") or 0)
+            entry = float(item.get("entry_price") or 0)
+            if amount <= 0:
+                # try live balance
+                amount = self.client.get_free_amount(symbol) * 0.998
+            if entry <= 0:
+                entry = self.client.get_ticker_price(f"{symbol}/{self.quote}")
+            if amount <= 0 or entry <= 0:
+                results.append({"symbol": symbol, "error": "no amount or price"})
+                continue
+
+            tp_price = entry * (1 + take_profit_pct / 100.0)
+            sl_price = entry * (1 - stop_loss_pct / 100.0)
+
+            order_id = None
+            try:
+                order = self.client.create_limit_sell(symbol, amount, tp_price)
+                order_id = order.get("id") if order else None
+            except Exception as e:
+                logger.exception(f"TP order failed for {symbol}")
+                results.append({
+                    "symbol": symbol,
+                    "entry_price": entry,
+                    "tp_price": tp_price,
+                    "sl_price": sl_price,
+                    "amount": amount,
+                    "tp_order_id": None,
+                    "error": str(e),
+                })
+                continue
+
+            results.append({
+                "symbol": symbol,
+                "entry_price": entry,
+                "tp_price": tp_price,
+                "sl_price": sl_price,
+                "amount": amount,
+                "tp_order_id": order_id,
+                "error": None,
+            })
+        return results
+
+    def cancel_tp_orders(self, coins_with_orders: List[Dict]) -> None:
+        """Cancel open TP limit orders. coins_with_orders: [{symbol, tp_order_id}, ...]"""
+        for item in coins_with_orders:
+            oid = item.get("tp_order_id")
+            sym = item.get("symbol")
+            if oid and sym:
+                try:
+                    self.client.cancel_order(oid, sym)
+                except Exception:
+                    pass
+
+    def check_and_manage_positions(
+        self,
+        positions: List[Any],
+    ) -> List[Dict]:
+        """
+        Cloud monitor:
+        - If price <= current_sl → market sell + cancel TP order
+        - If TP order filled → raise SL to tp_price (status = tp_hit)
+        - If already tp_hit and price <= current_sl → market sell
+        Returns list of actions taken.
+        """
+        actions = []
+        for coin in positions:
+            symbol = coin.symbol
+            status = coin.position_status or "idle"
+            if status not in ("open", "tp_hit"):
+                continue
+
+            try:
+                price = self.client.get_ticker_price(f"{symbol}/{self.quote}")
+            except Exception:
+                continue
+            if price <= 0:
+                continue
+
+            # Check if TP limit order still open
+            tp_filled = False
+            if coin.tp_order_id and status == "open":
+                try:
+                    order = self.client.fetch_order(coin.tp_order_id, symbol)
+                    if order and order.get("status") in ("closed", "filled"):
+                        tp_filled = True
+                    elif order is None:
+                        # order gone → assume filled or cancelled
+                        open_orders = self.client.fetch_open_orders(symbol)
+                        still_open = any(o.get("id") == coin.tp_order_id for o in open_orders)
+                        if not still_open:
+                            # check if we still hold the coin
+                            free = self.client.get_free_amount(symbol)
+                            if free < (coin.amount or 0) * 0.1:
+                                tp_filled = True
+                except Exception:
+                    pass
+
+            if tp_filled and status == "open":
+                # Raise SL to TP price
+                actions.append({
+                    "symbol": symbol,
+                    "action": "tp_hit_raise_sl",
+                    "old_sl": coin.current_sl_price,
+                    "new_sl": coin.tp_price,
+                    "price": price,
+                })
+                # caller will update DB: status=tp_hit, current_sl_price=tp_price, tp_order_id=None
+                continue
+
+            # Stop loss hit?
+            sl = float(coin.current_sl_price or 0)
+            if sl > 0 and price <= sl:
+                # Cancel any remaining TP order
+                if coin.tp_order_id:
+                    try:
+                        self.client.cancel_order(coin.tp_order_id, symbol)
+                    except Exception:
+                        pass
+                # Market sell remaining
+                amount = self.client.get_free_amount(symbol) * 0.998
+                sold = False
+                if amount > 0:
+                    try:
+                        self.client.create_market_order(
+                            f"{symbol}/{self.quote}", "sell", amount
+                        )
+                        sold = True
+                    except Exception as e:
+                        actions.append({
+                            "symbol": symbol,
+                            "action": "sl_sell_failed",
+                            "error": str(e),
+                            "price": price,
+                        })
+                        continue
+                actions.append({
+                    "symbol": symbol,
+                    "action": "sl_hit_sold",
+                    "sl": sl,
+                    "price": price,
+                    "amount": amount,
+                    "sold": sold,
+                    "was_raised": status == "tp_hit",
+                })
+        return actions
 
     def start_portfolio(
         self,

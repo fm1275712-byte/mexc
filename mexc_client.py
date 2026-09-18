@@ -151,3 +151,55 @@ class MexcClient:
             if market.get('quote') == self.quote and market.get('active', True) and market.get('spot', True):
                 bases.append(market['base'])
         return sorted(set(bases))
+
+    def create_limit_sell(self, symbol: str, amount: float, price: float) -> Optional[dict]:
+        """Place a limit sell order (used for Take Profit visible on MEXC)."""
+        pair = f"{symbol}/{self.quote}"
+        try:
+            # Round to exchange precision
+            amount = float(self.exchange.amount_to_precision(pair, amount))
+            price = float(self.exchange.price_to_precision(pair, price))
+            if amount <= 0 or price <= 0:
+                raise Exception(f"Invalid amount/price for {pair}: {amount} @ {price}")
+            order = self.exchange.create_order(
+                symbol=pair,
+                type='limit',
+                side='sell',
+                amount=amount,
+                price=price,
+            )
+            return order
+        except Exception as e:
+            raise Exception(f"Limit sell failed for {pair}: {str(e)}")
+
+    def cancel_order(self, order_id: str, symbol: str) -> Optional[dict]:
+        """Cancel an open order by id."""
+        pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
+        try:
+            return self.exchange.cancel_order(order_id, pair)
+        except Exception as e:
+            # Order may already be filled/cancelled
+            return None
+
+    def fetch_open_orders(self, symbol: str = None) -> List[dict]:
+        """Fetch open orders, optionally filtered by symbol."""
+        try:
+            if symbol:
+                pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
+                return self.exchange.fetch_open_orders(pair)
+            return self.exchange.fetch_open_orders()
+        except Exception:
+            return []
+
+    def fetch_order(self, order_id: str, symbol: str) -> Optional[dict]:
+        """Fetch a single order status."""
+        pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
+        try:
+            return self.exchange.fetch_order(order_id, pair)
+        except Exception:
+            return None
+
+    def get_free_amount(self, symbol: str) -> float:
+        """Free balance of a base asset."""
+        bal = self.get_balance()
+        return float(bal.get(symbol, 0.0))

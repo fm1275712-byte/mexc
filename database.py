@@ -20,6 +20,9 @@ class UserSettings(Base):
     min_trade_usdt = Column(Float, default=5.0)
     max_coins_per_portfolio = Column(Integer, default=30)  # raised 10 → 30
     min_usdt_per_coin = Column(Float, default=5.0)
+    # TP / SL percentages (configurable from Telegram bot)
+    take_profit_pct = Column(Float, default=5.0)   # هدف الربح %
+    stop_loss_pct = Column(Float, default=3.0)     # وقف الخسارة %
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -57,6 +60,13 @@ class PortfolioCoin(Base):
     portfolio_id = Column(Integer, ForeignKey("portfolios.id"), nullable=False)
     symbol = Column(String(20), nullable=False)
     target_percent = Column(Float, default=0.0)
+    # Position tracking for TP/SL
+    entry_price = Column(Float, default=0.0)
+    tp_price = Column(Float, default=0.0)
+    current_sl_price = Column(Float, default=0.0)
+    tp_order_id = Column(String(64), nullable=True)   # Limit sell order on MEXC
+    position_status = Column(String(20), default="idle")  # idle | open | tp_hit | closed
+    amount = Column(Float, default=0.0)  # quantity held after buy
     created_at = Column(DateTime, default=datetime.utcnow)
 
     portfolio = relationship("Portfolio", back_populates="coins")
@@ -149,8 +159,23 @@ def init_db():
             cols = [c["name"] for c in insp.get_columns("portfolio_coins")]
             if "target_percent" not in cols:
                 conn.execute(text("ALTER TABLE portfolio_coins ADD COLUMN target_percent DOUBLE PRECISION DEFAULT 0"))
+            for col, typ in [
+                ("entry_price", "DOUBLE PRECISION DEFAULT 0"),
+                ("tp_price", "DOUBLE PRECISION DEFAULT 0"),
+                ("current_sl_price", "DOUBLE PRECISION DEFAULT 0"),
+                ("tp_order_id", "VARCHAR(64)"),
+                ("position_status", "VARCHAR(20) DEFAULT 'idle'"),
+                ("amount", "DOUBLE PRECISION DEFAULT 0"),
+            ]:
+                if col not in cols:
+                    conn.execute(text(f"ALTER TABLE portfolio_coins ADD COLUMN {col} {typ}"))
 
         if "user_settings" in insp.get_table_names():
+            cols = [c["name"] for c in insp.get_columns("user_settings")]
+            if "take_profit_pct" not in cols:
+                conn.execute(text("ALTER TABLE user_settings ADD COLUMN take_profit_pct DOUBLE PRECISION DEFAULT 5.0"))
+            if "stop_loss_pct" not in cols:
+                conn.execute(text("ALTER TABLE user_settings ADD COLUMN stop_loss_pct DOUBLE PRECISION DEFAULT 3.0"))
             try:
                 conn.execute(text("UPDATE user_settings SET max_coins_per_portfolio = 30 WHERE max_coins_per_portfolio < 30 OR max_coins_per_portfolio IS NULL"))
             except Exception:
@@ -250,6 +275,44 @@ def set_portfolio_running(db, portfolio_id: int, running: bool):
         db.commit()
         return p
     return None
+
+
+def update_coin_position(db, coin_id: int, **kwargs):
+    """Update position fields on a PortfolioCoin."""
+    coin = db.query(PortfolioCoin).filter(PortfolioCoin.id == coin_id).first()
+    if not coin:
+        return None
+    for k, v in kwargs.items():
+        if hasattr(coin, k):
+            setattr(coin, k, v)
+    db.commit()
+    db.refresh(coin)
+    return coin
+
+
+def reset_coin_positions(db, portfolio_id: int):
+    """Reset all position tracking when portfolio is stopped."""
+    coins = db.query(PortfolioCoin).filter(PortfolioCoin.portfolio_id == portfolio_id).all()
+    for c in coins:
+        c.entry_price = 0.0
+        c.tp_price = 0.0
+        c.current_sl_price = 0.0
+        c.tp_order_id = None
+        c.position_status = "idle"
+        c.amount = 0.0
+    db.commit()
+
+
+def get_open_positions(db, telegram_id: int = None):
+    """Return all coins with open positions (for the monitor job)."""
+    q = db.query(PortfolioCoin).join(Portfolio).filter(
+        PortfolioCoin.position_status.in_(["open", "tp_hit"]),
+        Portfolio.is_running == True,
+        Portfolio.status == "active",
+    )
+    if telegram_id:
+        q = q.filter(Portfolio.telegram_id == telegram_id)
+    return q.all()
 
 
 def log_action(db, telegram_id: int, action: str, details: str, success: bool = True, portfolio_id: int = None):
