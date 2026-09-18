@@ -1739,6 +1739,8 @@ async def _do_manual_reentry(query, tid, event_id):
 
 
 async def _do_start(query, tid, pf_id):
+    import asyncio
+
     db = SessionLocal()
     try:
         p = get_portfolio(db, pf_id, tid)
@@ -1752,6 +1754,37 @@ async def _do_start(query, tid, pf_id):
         if p.is_running:
             await query.edit_message_text("المحفظة شغالة مسبقاً.", reply_markup=pf_keyboard(pf_id, True))
             return
+
+        # Check the wallet before buying so restarting a stopped portfolio
+        # cannot purchase coins that are already held.
+        try:
+            loop = asyncio.get_event_loop()
+            presence = await loop.run_in_executor(
+                None, lambda: get_mexc().get_portfolio_presence(coins)
+            )
+        except Exception as exc:
+            logger.exception("Portfolio start balance preflight failed")
+            await query.edit_message_text(
+                "⚠️ تعذر فحص أرصدة المحفظة من MEXC.\n"
+                "لم يتم تشغيل المحفظة ولم يتم تنفيذ أي شراء.\n\n"
+                f"الخطأ: `{exc}`",
+                parse_mode="Markdown",
+                reply_markup=pf_keyboard(pf_id, False),
+            )
+            return
+
+        present_coins = [
+            coin for coin in coins
+            if presence.get(str(coin).upper().strip(), {}).get("present", False)
+        ]
+        missing_coins = [coin for coin in coins if coin not in present_coins]
+        balance_lines = []
+        for coin in present_coins:
+            info = presence.get(str(coin).upper().strip(), {})
+            amount = float(info.get("amount") or 0)
+            value = float(info.get("market_value") or 0)
+            balance_lines.append(f"`{coin}`: `{amount:.6g}` ≈ `{value:.2f}` USDT")
+
         user = get_or_create_user(db, tid)
         # Portfolio-specific overrides, else user defaults
         def _pct(pf_val, user_val, default):
@@ -1767,15 +1800,36 @@ async def _do_start(query, tid, pf_id):
         s2 = _pct(getattr(p, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 30.0)
         sl_pct = _pct(getattr(p, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
 
-        await query.edit_message_text("⏳ جاري الشراء...")
-        result = get_reb().start_portfolio(
-            coins=coins, total_usdt=p.investment_usdt,
-            method=p.allocation_method or "equal", min_trade_usdt=5.0, dry_run=False,
-        )
-        if result.get("errors") and not result.get("executed"):
-            err = "\n".join(str(e) for e in result["errors"])
-            await query.edit_message_text(f"❌ فشل:\n`{err}`", parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, False))
-            return
+        purchase_result = {"executed": [], "errors": []}
+        if missing_coins:
+            # Keep the original per-coin allocation when only part of the
+            # stopped portfolio is missing; never buy already-held coins.
+            per_coin_usdt = float(p.investment_usdt or 0) / max(1, len(coins))
+            purchase_total = per_coin_usdt * len(missing_coins)
+            await query.edit_message_text(
+                "⏳ جاري فحص المحفظة ثم شراء العملات الناقصة فقط...\n"
+                f"الموجود: `{len(present_coins)}` | الناقص: `{len(missing_coins)}`"
+            )
+            purchase_result = await loop.run_in_executor(
+                None,
+                lambda: get_reb().start_portfolio(
+                    coins=missing_coins,
+                    total_usdt=purchase_total,
+                    method=p.allocation_method or "equal",
+                    min_trade_usdt=5.0,
+                    dry_run=False,
+                ),
+            )
+            if purchase_result.get("errors") and not purchase_result.get("executed"):
+                err = "\n".join(str(e) for e in purchase_result["errors"])
+                await query.edit_message_text(
+                    f"❌ فشل شراء العملات الناقصة:\n`{err}`",
+                    parse_mode="Markdown",
+                    reply_markup=pf_keyboard(pf_id, False),
+                )
+                return
+        else:
+            await query.edit_message_text("✅ الرصيد موجود. جاري تشغيل المحفظة بدون شراء جديد...")
 
         import time
         time.sleep(1.5)
@@ -1790,11 +1844,22 @@ async def _do_start(query, tid, pf_id):
         )
 
         lines = [
-            f"✅ تم تشغيل *{p.name}*",
+            (
+                f"✅ الرصيد موجود وتم تشغيل *{p.name}* بدون شراء جديد."
+                if not missing_coins
+                else f"✅ تم تشغيل *{p.name}*"
+            ),
             f"🎯 TP1 `{tp1}%`({s1}%) | TP2 `{tp2}%`({s2}%) | TP3 `{tp3}%`",
             f"🛡 استوب `{sl_pct}%`",
             "",
         ]
+        if balance_lines:
+            lines.extend(["💰 *الرصيد الموجود:*", *balance_lines, ""])
+        if missing_coins:
+            lines.append("🛒 تم شراء العملات الناقصة فقط: " + ", ".join(f"`{x}`" for x in missing_coins))
+            lines.append("")
+        if purchase_result.get("errors"):
+            lines.append("⚠️ ملاحظات الشراء:\n" + "\n".join(f"• {x}" for x in purchase_result["errors"]))
         for r in tp_results:
             coin_obj = next((c for c in p.coins if c.symbol == r["symbol"]), None)
             if not coin_obj:
