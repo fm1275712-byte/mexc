@@ -22,7 +22,10 @@ import config
 from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
     create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
-    close_portfolio, set_portfolio_running, log_action,
+    close_portfolio, delete_portfolio_completely, clear_coin_position,
+    delete_orphaned_portfolio_records,
+    set_portfolio_running, log_action,
+    Portfolio, PortfolioCoin, PortfolioTrade, RebalanceLog,
     get_signal_sources, get_signal_source, create_signal_source,
     update_signal_source, delete_signal_source, log_signal, parse_portfolio_ids,
     SignalLog, update_coin_position, reset_coin_positions, get_open_positions,
@@ -84,6 +87,7 @@ def main_menu_keyboard():
         [InlineKeyboardButton("➕ محفظة جديدة", callback_data="create_pf")],
         [InlineKeyboardButton("📡 مصادر الإشارات", callback_data="list_sources")],
         [InlineKeyboardButton("💰 الرصيد", callback_data="balance")],
+        [InlineKeyboardButton("🧹 تنظيف قاعدة البيانات", callback_data="cleanup_db")],
         [InlineKeyboardButton("⚙️ إعدادات", callback_data="settings")],
     ])
 
@@ -247,6 +251,239 @@ def format_source(s) -> str:
         f"محافظ البيع: `{s.sell_portfolio_ids or '—'}`\n"
         f"التبريد: `{s.cooldown_minutes}` دقيقة"
     )
+
+
+def _build_cleanup_plan(db, telegram_id: int, presence: Dict[str, Dict[str, float]]) -> Dict:
+    """Find only data that is provably inactive without touching working portfolios."""
+    portfolios = get_portfolios(db, telegram_id, status=None)
+    closed_portfolios = []
+    stale_positions = []
+
+    for portfolio in portfolios:
+        portfolio_has_live_asset = any(
+            presence.get(coin.symbol, {}).get("present", False)
+            for coin in portfolio.coins
+        )
+        if portfolio.status != "active" and not portfolio_has_live_asset:
+            closed_portfolios.append({
+                "id": portfolio.id,
+                "name": portfolio.name,
+                "coins": list(portfolio.coins),
+            })
+            continue
+
+        # A running portfolio is always protected. A stopped portfolio keeps
+        # its configuration, but stale position/TP/SL tracking is removable
+        # when MEXC confirms that the asset is no longer held.
+        if portfolio.status != "active" or portfolio.is_running:
+            continue
+        for coin in portfolio.coins:
+            if coin.position_status in (None, "", "idle", "waiting_reentry"):
+                continue
+            if presence.get(coin.symbol, {}).get("present", False):
+                continue
+            stale_positions.append({
+                "id": coin.id,
+                "portfolio_id": portfolio.id,
+                "portfolio_name": portfolio.name,
+                "symbol": coin.symbol,
+                "position_status": coin.position_status,
+                "coin": coin,
+            })
+
+    portfolio_ids = {portfolio.id for portfolio in portfolios}
+    trade_query = db.query(PortfolioTrade).filter(
+        PortfolioTrade.telegram_id == telegram_id
+    )
+    log_query = db.query(RebalanceLog).filter(
+        RebalanceLog.telegram_id == telegram_id
+    )
+    if portfolio_ids:
+        trade_query = trade_query.filter(~PortfolioTrade.portfolio_id.in_(portfolio_ids))
+        log_query = log_query.filter(~RebalanceLog.portfolio_id.in_(portfolio_ids))
+
+    return {
+        "closed_portfolios": closed_portfolios,
+        "stale_positions": stale_positions,
+        "orphan_trades": trade_query.count(),
+        "orphan_logs": log_query.count(),
+    }
+
+
+def _cleanup_report(plan: Dict) -> str:
+    closed = plan["closed_portfolios"]
+    stale = plan["stale_positions"]
+    orphan_trades = plan["orphan_trades"]
+    orphan_logs = plan["orphan_logs"]
+    lines = [
+        "🔎 *فحص قاعدة البيانات*",
+        "",
+        "تم الإبقاء على كل محفظة تعمل وكل عملة لها رصيد أو أمر بيع قائم على MEXC.",
+        "",
+        f"🗑 محافظ مغلقة بلا أصول: `{len(closed)}`",
+        f"🧹 مراكز قديمة بلا رصيد: `{len(stale)}`",
+        f"🧾 سجلات عمليات يتيمة: `{orphan_trades}` | سجلات إعادة توازن يتيمة: `{orphan_logs}`",
+    ]
+    if closed:
+        lines.append("\n*المحافظ المرشحة للحذف:*")
+        lines.extend(f"• #{item['id']} {item['name']}" for item in closed[:10])
+        if len(closed) > 10:
+            lines.append(f"• ... و`{len(closed) - 10}` أخرى")
+    if stale:
+        lines.append("\n*بيانات المراكز المرشحة للمسح:*")
+        lines.extend(
+            f"• {item['portfolio_name']} — `{item['symbol']}` ({item['position_status']})"
+            for item in stale[:15]
+        )
+        if len(stale) > 15:
+            lines.append(f"• ... و`{len(stale) - 15}` أخرى")
+    if not closed and not stale and not orphan_trades and not orphan_logs:
+        lines.append("\n✅ لا توجد بيانات قديمة آمنة للتنظيف.")
+    else:
+        lines.extend([
+            "",
+            "لن يتم بيع أي أصل في عملية التنظيف.",
+            "سيتم إلغاء أوامر الأهداف المرتبطة بالبيانات القديمة ثم حذفها فقط بعد إعادة الفحص.",
+        ])
+    return "\n".join(lines)
+
+
+async def _show_cleanup_scan(query, context, tid):
+    import asyncio
+
+    db = SessionLocal()
+    try:
+        await query.edit_message_text("⏳ جاري فحص المحافظ والرصيد قبل اقتراح التنظيف...")
+        portfolios = get_portfolios(db, tid, status=None)
+        symbols = sorted({
+            coin.symbol for portfolio in portfolios for coin in portfolio.coins
+        })
+        try:
+            loop = asyncio.get_event_loop()
+            presence = await loop.run_in_executor(
+                None,
+                lambda: get_mexc().get_portfolio_presence(symbols) if symbols else {},
+            )
+        except Exception as exc:
+            logger.exception("Database cleanup scan failed")
+            await query.edit_message_text(
+                "⚠️ تعذر فحص الرصيد من MEXC.\n"
+                "لم يتم حذف أو تعديل أي بيانات.\n\n"
+                f"الخطأ: `{exc}`",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        plan = _build_cleanup_plan(db, tid, presence)
+        context.user_data["cleanup_ready"] = True
+        buttons = []
+        if plan["closed_portfolios"] or plan["stale_positions"]:
+            buttons.append([
+                InlineKeyboardButton("✅ تأكيد التنظيف", callback_data="cleanup_confirm"),
+            ])
+        buttons.extend([
+            [InlineKeyboardButton("🔄 إعادة الفحص", callback_data="cleanup_db")],
+            [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
+        ])
+        await query.edit_message_text(
+            _cleanup_report(plan),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    finally:
+        db.close()
+
+
+async def _do_cleanup(query, context, tid):
+    import asyncio
+
+    db = SessionLocal()
+    try:
+        await query.edit_message_text("⏳ إعادة الفحص ثم تنظيف البيانات غير النشطة...")
+        portfolios = get_portfolios(db, tid, status=None)
+        symbols = sorted({
+            coin.symbol for portfolio in portfolios for coin in portfolio.coins
+        })
+        try:
+            loop = asyncio.get_event_loop()
+            presence = await loop.run_in_executor(
+                None,
+                lambda: get_mexc().get_portfolio_presence(symbols) if symbols else {},
+            )
+        except Exception as exc:
+            logger.exception("Database cleanup preflight failed")
+            await query.edit_message_text(
+                "⚠️ تعذر إعادة فحص الرصيد.\nلم يتم حذف أو تعديل أي بيانات.\n\n"
+                f"الخطأ: `{exc}`",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        plan = _build_cleanup_plan(db, tid, presence)
+        if (
+            not plan["closed_portfolios"]
+            and not plan["stale_positions"]
+            and not plan["orphan_trades"]
+            and not plan["orphan_logs"]
+        ):
+            context.user_data.pop("cleanup_ready", None)
+            await query.edit_message_text(
+                "✅ لا توجد بيانات قديمة آمنة للتنظيف بعد إعادة الفحص.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        cancelled = 0
+        cleared = 0
+        deleted_portfolios = 0
+
+        for item in plan["stale_positions"]:
+            coin = item["coin"]
+            result = get_reb().cancel_tp_orders([{
+                "symbol": coin.symbol,
+                "tp_order_id": coin.tp_order_id,
+                "tp1_order_id": coin.tp1_order_id,
+                "tp2_order_id": coin.tp2_order_id,
+                "tp3_order_id": coin.tp3_order_id,
+            }])
+            cancelled += len(result.get("cancelled", []))
+            if result.get("errors"):
+                continue
+            if clear_coin_position(db, coin.id):
+                cleared += 1
+
+        for item in plan["closed_portfolios"]:
+            portfolio_cancel_failed = False
+            for coin in item["coins"]:
+                result = get_reb().cancel_tp_orders([{
+                    "symbol": coin.symbol,
+                    "tp_order_id": coin.tp_order_id,
+                    "tp1_order_id": coin.tp1_order_id,
+                    "tp2_order_id": coin.tp2_order_id,
+                    "tp3_order_id": coin.tp3_order_id,
+                }])
+                cancelled += len(result.get("cancelled", []))
+                portfolio_cancel_failed = portfolio_cancel_failed or bool(result.get("errors"))
+            if not portfolio_cancel_failed and delete_portfolio_completely(db, item["id"], tid):
+                deleted_portfolios += 1
+
+        deleted_trades, deleted_logs = delete_orphaned_portfolio_records(db, tid)
+        context.user_data.pop("cleanup_ready", None)
+        await query.edit_message_text(
+            "✅ *تم تنظيف قاعدة البيانات بعد إعادة الفحص.*\n\n"
+            f"المحافظ المحذوفة: `{deleted_portfolios}`\n"
+            f"بيانات المراكز القديمة الممسوحة: `{cleared}`\n"
+            f"أوامر الأهداف الملغاة: `{cancelled}`\n\n"
+            f"سجلات العمليات اليتيمة المحذوفة: `{deleted_trades}`\n"
+            f"سجلات إعادة التوازن اليتيمة المحذوفة: `{deleted_logs}`\n\n"
+            "تم ترك المحافظ العاملة والعملات ذات الرصيد كما هي.",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+    finally:
+        db.close()
 
 
 def parse_signal_message(text: str) -> Optional[Dict[str, Any]]:
@@ -917,6 +1154,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="menu")]]))
         except Exception as e:
             await query.edit_message_text(f"خطأ:\n`{e}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        return
+
+    if data == "cleanup_db":
+        await _show_cleanup_scan(query, context, tid)
+        return
+
+    if data == "cleanup_confirm":
+        if not context.user_data.get("cleanup_ready"):
+            await query.edit_message_text(
+                "انتهت صلاحية تقرير التنظيف. شغّل الفحص مرة أخرى.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🧹 فحص قاعدة البيانات", callback_data="cleanup_db")],
+                    [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
+                ]),
+            )
+            return
+        await _do_cleanup(query, context, tid)
         return
 
     if data == "settings":
@@ -1956,12 +2210,88 @@ async def _do_remove_coin(query, tid, pf_id, symbol):
         if not p:
             await query.edit_message_text("غير موجودة.", reply_markup=main_menu_keyboard())
             return
-        try:
-            get_reb().stop_portfolio([symbol], dry_run=False)
-        except Exception:
-            pass
-        remove_coin_from_portfolio(db, pf_id, symbol)
-        await query.edit_message_text(f"✅ تم حذف `{symbol}`", parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, p.is_running))
+        coin = next((c for c in p.coins if c.symbol.upper() == symbol.upper()), None)
+        if not coin:
+            await query.edit_message_text(
+                f"العملة `{symbol}` غير موجودة في المحفظة.",
+                parse_mode="Markdown",
+                reply_markup=pf_keyboard(pf_id, p.is_running),
+            )
+            return
+
+        await query.edit_message_text(
+            f"⏳ جاري إلغاء أهداف `{coin.symbol}` وبيع الرصيد المتاح بسعر السوق..."
+        )
+        cancel_result = get_reb().cancel_tp_orders([{
+            "symbol": coin.symbol,
+            "tp_order_id": getattr(coin, "tp_order_id", None),
+            "tp1_order_id": getattr(coin, "tp1_order_id", None),
+            "tp2_order_id": getattr(coin, "tp2_order_id", None),
+            "tp3_order_id": getattr(coin, "tp3_order_id", None),
+        }])
+        if cancel_result.get("errors"):
+            error_text = "\n".join(
+                str(error.get("error") or error)
+                for error in cancel_result["errors"]
+            )
+            await query.edit_message_text(
+                f"❌ تعذر إلغاء كل أهداف `{coin.symbol}`.\n"
+                "لم يتم البيع أو حذف العملة من قاعدة البيانات حفاظًا على المركز.\n\n"
+                f"`{error_text}`",
+                parse_mode="Markdown",
+                reply_markup=pf_keyboard(pf_id, p.is_running),
+            )
+            return
+        other_running = db.query(PortfolioCoin).join(Portfolio).filter(
+            PortfolioCoin.symbol == coin.symbol,
+            PortfolioCoin.portfolio_id != p.id,
+            Portfolio.telegram_id == tid,
+            Portfolio.status == "active",
+            Portfolio.is_running == True,
+        ).first()
+        tracked_amount = float(
+            getattr(coin, "remaining_amount", 0)
+            or getattr(coin, "amount", 0)
+            or 0
+        )
+        if other_running and tracked_amount <= 0:
+            # This portfolio has no tracked position to sell. Do not sell the
+            # shared wallet balance that belongs to another running portfolio.
+            stop_result = {"executed": [], "errors": []}
+        else:
+            stop_result = get_reb().stop_portfolio(
+                [coin.symbol],
+                dry_run=False,
+                amount_overrides={coin.symbol: tracked_amount} if other_running else None,
+            )
+        errors = stop_result.get("errors") or []
+        if errors:
+            error_text = "\n".join(str(error) for error in errors)
+            await query.edit_message_text(
+                f"❌ لم يتم حذف `{coin.symbol}` من قاعدة البيانات لأن البيع لم يكتمل.\n"
+                "تمت محاولة إلغاء أهدافها، لكن يجب معالجة خطأ البيع أولًا.\n\n"
+                f"`{error_text}`",
+                parse_mode="Markdown",
+                reply_markup=pf_keyboard(pf_id, p.is_running),
+            )
+            return
+
+        if not remove_coin_from_portfolio(db, pf_id, coin.symbol):
+            await query.edit_message_text(
+                "تعذر حذف سجل العملة من قاعدة البيانات بعد نجاح البيع.",
+                reply_markup=pf_keyboard(pf_id, p.is_running),
+            )
+            return
+        cancelled = len(cancel_result.get("cancelled", []))
+        sold = sum(float(item.get("usdt") or 0) for item in stop_result.get("executed", []))
+        await query.edit_message_text(
+            f"✅ تم حذف `{coin.symbol}` من المحفظة.\n"
+            f"أوامر الأهداف الملغاة: `{cancelled}`\n"
+            f"البيع بسعر السوق: `{sold:.2f}` USDT\n"
+            "تم حذف وقف الخسارة السحابي مع بيانات العملة.",
+            parse_mode="Markdown",
+            reply_markup=pf_keyboard(pf_id, p.is_running),
+        )
     finally:
         db.close()
 
@@ -1975,6 +2305,14 @@ async def _do_close(query, tid, pf_id):
             return
         coins = [c.symbol for c in p.coins]
         if p.is_running and coins:
+            tp_orders = [{
+                "symbol": c.symbol,
+                "tp_order_id": getattr(c, "tp_order_id", None),
+                "tp1_order_id": getattr(c, "tp1_order_id", None),
+                "tp2_order_id": getattr(c, "tp2_order_id", None),
+                "tp3_order_id": getattr(c, "tp3_order_id", None),
+            } for c in p.coins]
+            get_reb().cancel_tp_orders(tp_orders)
             get_reb().stop_portfolio(coins, dry_run=False)
         close_portfolio(db, pf_id)
         await query.edit_message_text("✅ تم حذف المحفظة.", reply_markup=main_menu_keyboard())

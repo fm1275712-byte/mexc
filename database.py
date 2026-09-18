@@ -321,6 +321,80 @@ def remove_coin_from_portfolio(db, portfolio_id: int, symbol: str) -> bool:
     return deleted > 0
 
 
+def delete_portfolio_completely(db, portfolio_id: int, telegram_id: int = None) -> bool:
+    """Delete a portfolio and its non-relational history after an explicit cleanup."""
+    q = db.query(Portfolio).filter(Portfolio.id == portfolio_id)
+    if telegram_id is not None:
+        q = q.filter(Portfolio.telegram_id == telegram_id)
+    portfolio = q.first()
+    if not portfolio:
+        return False
+
+    db.query(PortfolioTrade).filter(
+        PortfolioTrade.portfolio_id == portfolio_id
+    ).delete(synchronize_session=False)
+    db.query(RebalanceLog).filter(
+        RebalanceLog.portfolio_id == portfolio_id
+    ).delete(synchronize_session=False)
+    db.delete(portfolio)
+    db.commit()
+    return True
+
+
+def clear_coin_position(db, coin_id: int) -> bool:
+    """Clear stale TP/SL tracking while keeping the configured coin in its portfolio."""
+    coin = db.query(PortfolioCoin).filter(PortfolioCoin.id == coin_id).first()
+    if not coin:
+        return False
+    coin.entry_price = 0.0
+    coin.tp_price = 0.0
+    coin.tp1_price = 0.0
+    coin.tp2_price = 0.0
+    coin.tp3_price = 0.0
+    coin.current_sl_price = 0.0
+    coin.tp_order_id = None
+    coin.tp1_order_id = None
+    coin.tp2_order_id = None
+    coin.tp3_order_id = None
+    coin.position_status = "idle"
+    coin.amount = 0.0
+    coin.remaining_amount = 0.0
+    coin.original_sl_price = 0.0
+    coin.reentry_price = 0.0
+    coin.reentry_used = False
+    coin.reentry_touched = False
+    db.commit()
+    return True
+
+
+def delete_orphaned_portfolio_records(db, telegram_id: int):
+    """Remove trade/log rows that reference a portfolio no longer in the DB."""
+    portfolio_ids = {
+        portfolio_id
+        for (portfolio_id,) in db.query(Portfolio.id).filter(
+            Portfolio.telegram_id == telegram_id
+        ).all()
+    }
+    trade_query = db.query(PortfolioTrade).filter(
+        PortfolioTrade.telegram_id == telegram_id
+    )
+    log_query = db.query(RebalanceLog).filter(
+        RebalanceLog.telegram_id == telegram_id
+    )
+    if portfolio_ids:
+        trade_query = trade_query.filter(
+            ~PortfolioTrade.portfolio_id.in_(portfolio_ids)
+        )
+        log_query = log_query.filter(
+            ~RebalanceLog.portfolio_id.in_(portfolio_ids)
+        )
+    trade_count = trade_query.delete(synchronize_session=False)
+    log_count = log_query.delete(synchronize_session=False)
+    if trade_count or log_count:
+        db.commit()
+    return trade_count, log_count
+
+
 def close_portfolio(db, portfolio_id: int):
     p = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
     if p:

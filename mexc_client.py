@@ -254,13 +254,15 @@ class MexcClient:
         except Exception as e:
             raise Exception(f"Limit sell failed for {pair}: {str(e)}")
 
-    def cancel_order(self, order_id: str, symbol: str) -> Optional[dict]:
+    def cancel_order(self, order_id: str, symbol: str, strict: bool = False) -> Optional[dict]:
         """Cancel an open order by id."""
         pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
         try:
             return self.exchange.cancel_order(order_id, pair)
         except Exception as e:
             # Order may already be filled/cancelled
+            if strict:
+                raise
             return None
 
     def fetch_open_orders(self, symbol: str = None) -> List[dict]:
@@ -272,6 +274,13 @@ class MexcClient:
             return self.exchange.fetch_open_orders()
         except Exception:
             return []
+
+    def fetch_open_sell_orders(self, symbol: str) -> List[dict]:
+        """Fetch only open sell orders for a base asset."""
+        return [
+            order for order in self.fetch_open_orders(symbol)
+            if str(order.get("side") or "").lower() == "sell"
+        ]
 
     def fetch_order(self, order_id: str, symbol: str) -> Optional[dict]:
         """Fetch a single order status."""

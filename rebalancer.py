@@ -68,7 +68,12 @@ class Rebalancer:
                 results["errors"].append({coin: str(e)})
         return results
 
-    def stop_portfolio(self, coins: List[str], dry_run: bool = False) -> Dict:
+    def stop_portfolio(
+        self,
+        coins: List[str],
+        dry_run: bool = False,
+        amount_overrides: Optional[Dict[str, float]] = None,
+    ) -> Dict:
         """Sell all holdings of the given coins."""
         results = {
             "action": "stop",
@@ -80,7 +85,11 @@ class Rebalancer:
         balances = self.client.get_balance()
         prices = self.client.get_all_prices(coins)
         for coin in coins:
-            amount = float(balances.get(coin, 0.0))
+            override = (amount_overrides or {}).get(coin)
+            if override is None:
+                amount = float(balances.get(coin, 0.0))
+            else:
+                amount = min(float(override or 0.0), float(balances.get(coin, 0.0)))
             if amount <= 0:
                 continue
             amount = amount * 0.999
@@ -183,7 +192,8 @@ class Rebalancer:
             })
         return results
 
-    def cancel_tp_orders(self, coins_with_orders: List[Dict]) -> None:
+    def cancel_tp_orders(self, coins_with_orders: List[Dict]) -> Dict[str, List]:
+        results = {"cancelled": [], "errors": []}
         for item in coins_with_orders:
             sym = item.get("symbol")
             if not sym:
@@ -192,9 +202,31 @@ class Rebalancer:
                 oid = item.get(key)
                 if oid:
                     try:
-                        self.client.cancel_order(oid, sym)
-                    except Exception:
-                        pass
+                        self.client.cancel_order(oid, sym, strict=True)
+                        results["cancelled"].append({"symbol": sym, "order_id": oid, "field": key})
+                    except Exception as exc:
+                        error_text = str(exc)
+                        normalized_error = error_text.lower()
+                        if any(marker in normalized_error for marker in (
+                            "not found", "does not exist", "already canceled",
+                            "already cancelled", "order closed", "filled",
+                        )):
+                            # The exchange confirms that this ID is no longer
+                            # open, so it is safe to continue the cleanup.
+                            results["cancelled"].append({
+                                "symbol": sym,
+                                "order_id": oid,
+                                "field": key,
+                                "already_closed": True,
+                            })
+                        else:
+                            results["errors"].append({
+                                "symbol": sym,
+                                "order_id": oid,
+                                "field": key,
+                                "error": error_text,
+                            })
+        return results
 
     def _order_filled(self, order_id: Optional[str], symbol: str) -> bool:
         return self._filled_order_info(order_id, symbol) is not None
