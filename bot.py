@@ -1402,8 +1402,10 @@ async def _show_missing_reentry(query, context, tid, pf_id, toggle_symbol=None):
             context.user_data.pop(key, None)
             await query.edit_message_text(
                 f"✅ فحص *{pf.name}* مكتمل.\n"
-                f"كل العملات المسجلة ({len(symbols)}) موجودة في الرصيد الكلي.\n"
-                "تم احتساب العملات الموجودة داخل أوامر البيع المفتوحة.",
+                f"كل العملات المسجلة ({len(symbols)}) موجودة بقيمة سوقية فعلية "
+                f"(أكبر من `{config.BALANCE_PRESENCE_MIN_USDT:g}` USDT).\n"
+                "تم احتساب العملات الموجودة داخل أوامر البيع المفتوحة، "
+                "وتجاهل بقايا البيع الصغيرة.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
@@ -1417,6 +1419,7 @@ async def _show_missing_reentry(query, context, tid, pf_id, toggle_symbol=None):
             "",
             f"المسجلة: `{len(symbols)}` | الموجودة: `{present_count}` | الناقصة: `{len(missing_symbols)}`",
             "",
+            f"يتم تجاهل بقايا البيع الأقل من `{config.BALANCE_PRESENCE_MIN_USDT:g}` USDT.",
             (
                 "اختر العملات التي تريد إعادة دخولها."
                 if pf.is_running

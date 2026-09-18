@@ -69,6 +69,10 @@ class MexcClient:
 
         Total balance is intentional here: a coin locked in an open sell order
         is still owned and must not be offered for re-entry.
+
+        A small residual amount can remain after a market sell because the
+        rebalancer keeps a safety buffer for fees and exchange precision.
+        That dust should not make a sold portfolio coin look present.
         """
         requested = [str(symbol).upper().strip() for symbol in symbols if symbol]
         normalized = list(dict.fromkeys(
@@ -77,12 +81,25 @@ class MexcClient:
         balances = self.get_total_balance()
         prices = self.get_all_prices(normalized)
         result = {}
+        minimum_value = max(
+            0.0,
+            float(getattr(config, "BALANCE_PRESENCE_MIN_USDT", 1.0)),
+        )
         for requested_symbol in requested:
             asset = self.normalize_asset_symbol(requested_symbol)
+            amount = float(balances.get(asset, 0.0))
+            price = float(prices.get(asset, 0.0))
+            market_value = amount * price if price > 0 else 0.0
+            # If the ticker is unavailable, do not classify an asset as
+            # missing just because its value cannot be calculated.
+            present = amount > 0 and (
+                price <= 0 or market_value >= minimum_value
+            )
             info = {
-                "amount": float(balances.get(asset, 0.0)),
-                "price": float(prices.get(asset, 0.0)),
-                "present": float(balances.get(asset, 0.0)) > 0,
+                "amount": amount,
+                "price": price,
+                "market_value": market_value,
+                "present": present,
             }
             # Keep the requested key for the bot UI, and the normalized alias
             # for callers that already use base symbols.
