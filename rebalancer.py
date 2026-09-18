@@ -324,8 +324,10 @@ class Rebalancer:
 
                 was_raised = status in ("tp1_hit", "tp2_hit", "tp3_hit", "tp_hit")
                 orig_sl = float(getattr(coin, "original_sl_price", 0) or 0)
-                # Smart re-entry only if we already took profit (raised SL) and have original SL
-                if was_raised and orig_sl > 0 and not getattr(coin, "reentry_used", False):
+                # After any stop hit, wait for the original SL zone and a
+                # bounce before one re-entry. This also covers a first-time
+                # hit on the original stop, not only a raised stop after TP.
+                if orig_sl > 0 and not getattr(coin, "reentry_used", False):
                     actions.append({
                         "symbol": symbol,
                         "action": "sl_hit_wait_reentry",
@@ -333,6 +335,7 @@ class Rebalancer:
                         "price": price,
                         "amount": amount,
                         "sold": sold,
+                        "was_raised": was_raised,
                         "reentry_price": orig_sl,
                     })
                 else:

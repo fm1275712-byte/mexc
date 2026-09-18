@@ -1508,7 +1508,7 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     reentry_used=False,
                 )
                 msg = (
-                    f"🛡 *ضرب الاستوب المرفوع* — `{symbol}`\n"
+                    f"🛡 *ضرب الاستوب{' المرفوع' if act.get('was_raised') else ''}* — `{symbol}`\n"
                     f"تم البيع ≈ `{act['price']:.6g}`\n"
                     f"⏳ انتظار إعادة دخول عند الاستوب الأصلي `{act['reentry_price']:.6g}`\n"
                     f"(لمس + ارتداد 1%)\n"
