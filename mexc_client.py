@@ -16,13 +16,33 @@ class MexcClient:
         })
         self.quote = config.QUOTE_ASSET
 
+    @staticmethod
+    def normalize_asset_symbol(symbol: str) -> str:
+        """Normalize a wallet asset or a configured trading symbol to its base asset."""
+        value = str(symbol or "").strip().upper().replace(" ", "")
+        value = value.lstrip("$")
+        for separator in ("/", ":", "-"):
+            if separator in value:
+                value = value.split(separator, 1)[0]
+                break
+        return value
+
+    @staticmethod
+    def _as_float(value) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def get_balance(self) -> Dict:
         """Return free balances only (non-zero)"""
         balance = self.exchange.fetch_balance()
         free = {}
         for asset, amount in balance.get('free', {}).items():
-            if amount and float(amount) > 0:
-                free[asset] = float(amount)
+            value = self._as_float(amount)
+            if value > 0:
+                key = self.normalize_asset_symbol(asset)
+                free[key] = max(free.get(key, 0.0), value)
         return free
 
     def get_total_balance(self) -> Dict[str, float]:
@@ -32,15 +52,16 @@ class MexcClient:
         free = balance.get("free") or {}
         result = {}
         for asset in set(totals) | set(free):
-            amount = totals.get(asset)
-            if amount is None:
-                amount = free.get(asset)
-            try:
-                value = float(amount or 0)
-            except (TypeError, ValueError):
-                value = 0.0
+            # Some exchange responses expose a zero/empty total while free
+            # already contains the actual available amount. Use the larger
+            # value so a present wallet asset is not reported as missing.
+            value = max(
+                self._as_float(totals.get(asset)),
+                self._as_float(free.get(asset)),
+            )
             if value > 0:
-                result[asset] = value
+                key = self.normalize_asset_symbol(asset)
+                result[key] = max(result.get(key, 0.0), value)
         return result
 
     def get_portfolio_presence(self, symbols: List[str]) -> Dict[str, Dict[str, float]]:
@@ -49,17 +70,25 @@ class MexcClient:
         Total balance is intentional here: a coin locked in an open sell order
         is still owned and must not be offered for re-entry.
         """
-        normalized = [str(symbol).upper().strip() for symbol in symbols if symbol]
+        requested = [str(symbol).upper().strip() for symbol in symbols if symbol]
+        normalized = list(dict.fromkeys(
+            self.normalize_asset_symbol(symbol) for symbol in requested
+        ))
         balances = self.get_total_balance()
         prices = self.get_all_prices(normalized)
-        return {
-            symbol: {
-                "amount": float(balances.get(symbol, 0.0)),
-                "price": float(prices.get(symbol, 0.0)),
-                "present": float(balances.get(symbol, 0.0)) > 0,
+        result = {}
+        for requested_symbol in requested:
+            asset = self.normalize_asset_symbol(requested_symbol)
+            info = {
+                "amount": float(balances.get(asset, 0.0)),
+                "price": float(prices.get(asset, 0.0)),
+                "present": float(balances.get(asset, 0.0)) > 0,
             }
-            for symbol in normalized
-        }
+            # Keep the requested key for the bot UI, and the normalized alias
+            # for callers that already use base symbols.
+            result[requested_symbol] = info
+            result[asset] = info
+        return result
 
     def get_free_usdt(self) -> float:
         bal = self.get_balance()
