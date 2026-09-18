@@ -94,10 +94,6 @@ def pf_keyboard(pf_id: int, is_running: bool):
         rows.append([InlineKeyboardButton("▶️ تشغيل", callback_data=f"start_{pf_id}")])
     rows.append([InlineKeyboardButton("📈 زيادة استثمار", callback_data=f"increase_{pf_id}")])
     rows.append([
-        InlineKeyboardButton("🔄 معاينة إعادة توازن", callback_data=f"rebal_dry_{pf_id}"),
-        InlineKeyboardButton("✅ تنفيذ إعادة توازن", callback_data=f"rebal_run_{pf_id}"),
-    ])
-    rows.append([
         InlineKeyboardButton("➕ عملة", callback_data=f"addcoin_{pf_id}"),
         InlineKeyboardButton("➖ عملة", callback_data=f"removecoin_{pf_id}"),
     ])
@@ -136,15 +132,23 @@ def format_pf(p) -> str:
         f"الحالة: {status}",
         f"المخصص: `{p.investment_usdt:.2f}` USDT",
         f"العملات: `{coins}`",
-        f"العتبة: `{p.threshold}%`",
     ]
     if p.is_running:
         for c in p.coins:
-            if c.position_status in ("open", "tp_hit") and c.entry_price:
-                st = "🎯 هدف متحقق" if c.position_status == "tp_hit" else "مفتوح"
+            if c.position_status in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit") and c.entry_price:
+                st_map = {
+                    "open": "مفتوح",
+                    "tp1_hit": "TP1 ✓",
+                    "tp2_hit": "TP2 ✓",
+                    "tp3_hit": "TP3 ✓",
+                    "tp_hit": "هدف ✓",
+                }
+                st = st_map.get(c.position_status, c.position_status)
                 lines.append(
-                    f"  `{c.symbol}` دخول `{c.entry_price:.6g}` | "
-                    f"هدف `{c.tp_price:.6g}` | استوب `{c.current_sl_price:.6g}` ({st})"
+                    f"  `{c.symbol}` دخول `{c.entry_price:.6g}`\n"
+                    f"    TP1 `{getattr(c,'tp1_price',0):.6g}` | TP2 `{getattr(c,'tp2_price',0):.6g}` | "
+                    f"TP3 `{getattr(c,'tp3_price',0):.6g}`\n"
+                    f"    استوب `{c.current_sl_price:.6g}` ({st})"
                 )
     return "\n".join(lines)
 
@@ -589,7 +593,7 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("waiting"):
         # Handle TP/SL percentage edit from settings
         edit_key = context.user_data.get("edit_setting")
-        if edit_key in ("take_profit_pct", "stop_loss_pct"):
+        if edit_key in ("take_profit_pct", "stop_loss_pct", "tp1_pct", "tp2_pct", "tp3_pct", "tp1_sell_pct", "tp2_sell_pct"):
             if not await ensure_admin(update):
                 return
             try:
@@ -602,7 +606,16 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user = get_or_create_user(db, update.effective_user.id)
                     setattr(user, edit_key, val)
                     db.commit()
-                    label = "هدف الربح" if edit_key == "take_profit_pct" else "وقف الخسارة"
+                    labels = {
+                        "take_profit_pct": "هدف الربح",
+                        "stop_loss_pct": "وقف الخسارة",
+                        "tp1_pct": "الهدف 1",
+                        "tp2_pct": "الهدف 2",
+                        "tp3_pct": "الهدف 3",
+                        "tp1_sell_pct": "نسبة البيع عند الهدف 1",
+                        "tp2_sell_pct": "نسبة البيع عند الهدف 2",
+                    }
+                    label = labels.get(edit_key, edit_key)
                     await update.message.reply_text(
                         f"✅ تم ضبط *{label}* إلى `{val}%`",
                         parse_mode="Markdown",
@@ -687,22 +700,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db = SessionLocal()
         try:
             user = get_or_create_user(db, tid)
-            tp = getattr(user, "take_profit_pct", 5.0) or 5.0
+            tp1 = getattr(user, "tp1_pct", 3.0) or 3.0
+            tp2 = getattr(user, "tp2_pct", 5.0) or 5.0
+            tp3 = getattr(user, "tp3_pct", 8.0) or 8.0
+            s1 = getattr(user, "tp1_sell_pct", 40.0) or 40.0
+            s2 = getattr(user, "tp2_sell_pct", 30.0) or 30.0
             sl = getattr(user, "stop_loss_pct", 3.0) or 3.0
             text = (
                 f"⚙️ *الإعدادات*\n\n"
-                f"عتبة إعادة التوازن: `{user.default_threshold}%`\n"
                 f"أقل صفقة: `{user.min_trade_usdt}` USDT\n"
-                f"أقصى عملات لكل محفظة: `{user.max_coins_per_portfolio}`\n\n"
-                f"🎯 *هدف الربح:* `{tp}%`\n"
+                f"أقصى عملات: `{user.max_coins_per_portfolio}`\n\n"
+                f"🎯 *الهدف 1:* `{tp1}%` (بيع `{s1}%`)\n"
+                f"🎯 *الهدف 2:* `{tp2}%` (بيع `{s2}%`)\n"
+                f"🎯 *الهدف 3:* `{tp3}%` (الباقي)\n"
                 f"🛡 *وقف الخسارة:* `{sl}%`"
             )
             await query.edit_message_text(
                 text,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎯 تعديل هدف الربح %", callback_data="edit_tp")],
-                    [InlineKeyboardButton("🛡 تعديل وقف الخسارة %", callback_data="edit_sl")],
+                    [InlineKeyboardButton("🎯 هدف 1 %", callback_data="edit_tp1"),
+                     InlineKeyboardButton("بيع عند 1 %", callback_data="edit_tp1_sell")],
+                    [InlineKeyboardButton("🎯 هدف 2 %", callback_data="edit_tp2"),
+                     InlineKeyboardButton("بيع عند 2 %", callback_data="edit_tp2_sell")],
+                    [InlineKeyboardButton("🎯 هدف 3 %", callback_data="edit_tp3")],
+                    [InlineKeyboardButton("🛡 وقف الخسارة %", callback_data="edit_sl")],
                     [InlineKeyboardButton("⬅️ رجوع", callback_data="menu")],
                 ]),
             )
@@ -710,21 +732,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.close()
         return
 
-    if data == "edit_tp":
+    edit_map = {
+        "edit_tp1": ("tp1_pct", "نسبة الهدف 1 (مثال: 3)"),
+        "edit_tp2": ("tp2_pct", "نسبة الهدف 2 (مثال: 5)"),
+        "edit_tp3": ("tp3_pct", "نسبة الهدف 3 (مثال: 8)"),
+        "edit_tp1_sell": ("tp1_sell_pct", "نسبة البيع عند الهدف 1 من الكمية (مثال: 40)"),
+        "edit_tp2_sell": ("tp2_sell_pct", "نسبة البيع عند الهدف 2 من الكمية (مثال: 30)"),
+        "edit_sl": ("stop_loss_pct", "نسبة وقف الخسارة (مثال: 3)"),
+    }
+    if data in edit_map:
+        field, prompt = edit_map[data]
         context.user_data["waiting"] = True
-        context.user_data["edit_setting"] = "take_profit_pct"
+        context.user_data["edit_setting"] = field
         await query.edit_message_text(
-            "أرسل نسبة *هدف الربح* الجديدة (مثال: `5` يعني 5%):",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="settings")]]),
-        )
-        return
-
-    if data == "edit_sl":
-        context.user_data["waiting"] = True
-        context.user_data["edit_setting"] = "stop_loss_pct"
-        await query.edit_message_text(
-            "أرسل نسبة *وقف الخسارة* الجديدة (مثال: `3` يعني 3%):",
+            f"أرسل *{prompt}*:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="settings")]]),
         )
@@ -747,12 +768,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["waiting"] = True
         await query.edit_message_text("أرسل مبلغ الزيادة بالـ USDT:")
         return INCREASE_AMOUNT
-    if data.startswith("rebal_dry_"):
-        await _do_rebalance(query, tid, int(data.split("_")[2]), dry_run=True)
-        return
-    if data.startswith("rebal_run_"):
-        await _do_rebalance(query, tid, int(data.split("_")[2]), dry_run=False)
-        return
     if data.startswith("addcoin_"):
         context.user_data["addcoin_pf"] = int(data.split("_")[1])
         context.user_data["waiting"] = True
@@ -905,7 +920,11 @@ async def _do_start(query, tid, pf_id):
             await query.edit_message_text("المحفظة شغالة مسبقاً.", reply_markup=pf_keyboard(pf_id, True))
             return
         user = get_or_create_user(db, tid)
-        tp_pct = getattr(user, "take_profit_pct", 5.0) or 5.0
+        tp1 = getattr(user, "tp1_pct", 3.0) or 3.0
+        tp2 = getattr(user, "tp2_pct", 5.0) or 5.0
+        tp3 = getattr(user, "tp3_pct", 8.0) or 8.0
+        s1 = getattr(user, "tp1_sell_pct", 40.0) or 40.0
+        s2 = getattr(user, "tp2_sell_pct", 30.0) or 30.0
         sl_pct = getattr(user, "stop_loss_pct", 3.0) or 3.0
 
         await query.edit_message_text("⏳ جاري الشراء...")
@@ -918,54 +937,53 @@ async def _do_start(query, tid, pf_id):
             await query.edit_message_text(f"❌ فشل:\n`{err}`", parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, False))
             return
 
-        # Build coins_data from live balances + prices for TP/SL
         import time
-        time.sleep(1.5)  # let balances settle
+        time.sleep(1.5)
         coins_data = []
         for c in p.coins:
             amount = get_mexc().get_free_amount(c.symbol)
             price = get_mexc().get_ticker_price(f"{c.symbol}/USDT")
             coins_data.append({"symbol": c.symbol, "amount": amount, "entry_price": price})
 
-        tp_results = get_reb().place_tp_orders(coins_data, tp_pct, sl_pct)
+        tp_results = get_reb().place_tp_orders(
+            coins_data, tp1, tp2, tp3, sl_pct, s1, s2
+        )
 
-        # Save position data to DB
-        from database import update_coin_position
-        lines = [f"✅ تم تشغيل *{p.name}*", f"🎯 هدف: `{tp_pct}%` | 🛡 استوب: `{sl_pct}%`", ""]
+        lines = [
+            f"✅ تم تشغيل *{p.name}*",
+            f"🎯 TP1 `{tp1}%`({s1}%) | TP2 `{tp2}%`({s2}%) | TP3 `{tp3}%`",
+            f"🛡 استوب `{sl_pct}%`",
+            "",
+        ]
         for r in tp_results:
             coin_obj = next((c for c in p.coins if c.symbol == r["symbol"]), None)
             if not coin_obj:
                 continue
-            if r.get("error") and not r.get("tp_order_id"):
+            update_coin_position(
+                db, coin_obj.id,
+                entry_price=r.get("entry_price", 0),
+                tp1_price=r.get("tp1_price", 0),
+                tp2_price=r.get("tp2_price", 0),
+                tp3_price=r.get("tp3_price", 0),
+                tp_price=r.get("tp1_price", 0),
+                current_sl_price=r.get("sl_price", 0),
+                amount=r.get("amount", 0),
+                remaining_amount=r.get("amount", 0),
+                tp1_order_id=r.get("tp1_order_id"),
+                tp2_order_id=r.get("tp2_order_id"),
+                tp3_order_id=r.get("tp3_order_id"),
+                position_status="open",
+            )
+            if r.get("error"):
                 lines.append(f"⚠️ `{r['symbol']}`: {r['error']}")
-                update_coin_position(
-                    db, coin_obj.id,
-                    entry_price=r.get("entry_price", 0),
-                    tp_price=r.get("tp_price", 0),
-                    current_sl_price=r.get("sl_price", 0),
-                    amount=r.get("amount", 0),
-                    tp_order_id=None,
-                    position_status="open",
-                )
-            else:
-                update_coin_position(
-                    db, coin_obj.id,
-                    entry_price=r["entry_price"],
-                    tp_price=r["tp_price"],
-                    current_sl_price=r["sl_price"],
-                    amount=r["amount"],
-                    tp_order_id=r.get("tp_order_id"),
-                    position_status="open",
-                )
-                lines.append(
-                    f"`{r['symbol']}` دخول `{r['entry_price']:.6g}` → "
-                    f"هدف `{r['tp_price']:.6g}` | استوب `{r['sl_price']:.6g}`"
-                )
-                if r.get("tp_order_id"):
-                    lines.append(f"  📌 أمر Limit على MEXC: `{r['tp_order_id']}`")
+            lines.append(
+                f"`{r['symbol']}` دخول `{r.get('entry_price',0):.6g}`\n"
+                f"  TP1 `{r.get('tp1_price',0):.6g}` | TP2 `{r.get('tp2_price',0):.6g}` | "
+                f"TP3 `{r.get('tp3_price',0):.6g}` | SL `{r.get('sl_price',0):.6g}`"
+            )
 
         set_portfolio_running(db, pf_id, True)
-        log_action(db, tid, "start", f"Started {p.name} TP={tp_pct}% SL={sl_pct}%", True, pf_id)
+        log_action(db, tid, "start", f"Started {p.name} multi-TP", True, pf_id)
         await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, True))
     finally:
         db.close()
@@ -982,12 +1000,16 @@ async def _do_stop(query, tid, pf_id):
         await query.edit_message_text("⏳ جاري الإيقاف (إلغاء أوامر الهدف + بيع)...")
 
         # Cancel any open TP limit orders on MEXC
-        tp_orders = [
-            {"symbol": c.symbol, "tp_order_id": c.tp_order_id}
-            for c in p.coins if c.tp_order_id
-        ]
-        if tp_orders:
-            get_reb().cancel_tp_orders(tp_orders)
+        tp_orders = []
+        for c in p.coins:
+            tp_orders.append({
+                "symbol": c.symbol,
+                "tp_order_id": getattr(c, "tp_order_id", None),
+                "tp1_order_id": getattr(c, "tp1_order_id", None),
+                "tp2_order_id": getattr(c, "tp2_order_id", None),
+                "tp3_order_id": getattr(c, "tp3_order_id", None),
+            })
+        get_reb().cancel_tp_orders(tp_orders)
 
         if coins:
             get_reb().stop_portfolio(coins, dry_run=False)
@@ -1004,27 +1026,6 @@ async def _do_stop(query, tid, pf_id):
     finally:
         db.close()
 
-
-async def _do_rebalance(query, tid, pf_id, dry_run: bool):
-    db = SessionLocal()
-    try:
-        p = get_portfolio(db, pf_id, tid)
-        if not p:
-            await query.edit_message_text("غير موجودة.", reply_markup=main_menu_keyboard())
-            return
-        coins = [c.symbol for c in p.coins]
-        if not coins:
-            await query.edit_message_text("بدون عملات.", reply_markup=pf_keyboard(pf_id, p.is_running))
-            return
-        await query.edit_message_text("⏳ جاري الحساب..." if dry_run else "⏳ جاري التنفيذ...")
-        result = get_reb().rebalance(coins=coins, total_usdt=p.investment_usdt,
-                                     method=p.allocation_method or "equal", threshold_pct=p.threshold,
-                                     min_trade_usdt=5.0, dry_run=dry_run)
-        msg = result.get("summary", str(result))
-        await query.edit_message_text(f"{'🔄 معاينة' if dry_run else '✅ تم'}:\n`{msg}`", parse_mode="Markdown",
-                                      reply_markup=pf_keyboard(pf_id, p.is_running))
-    finally:
-        db.close()
 
 
 async def _do_remove_coin(query, tid, pf_id, symbol):
@@ -1283,17 +1284,51 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
             pf = coin.portfolio
             tid = pf.telegram_id if pf else config.ADMIN_TELEGRAM_ID
 
-            if act["action"] == "tp_hit_raise_sl":
+            if act["action"] == "tp1_hit":
                 update_coin_position(
                     db, coin.id,
-                    position_status="tp_hit",
-                    current_sl_price=coin.tp_price,
-                    tp_order_id=None,
+                    position_status="tp1_hit",
+                    current_sl_price=act["new_sl"],
+                    tp1_order_id=None,
                 )
                 msg = (
-                    f"🎯 *تحقق الهدف* — `{symbol}`\n"
-                    f"السعر الحالي: `{act['price']:.6g}`\n"
-                    f"تم رفع الاستوب إلى `{coin.tp_price:.6g}` (سعر الهدف)\n"
+                    f"🎯 *تحقق الهدف 1* — `{symbol}`\n"
+                    f"السعر: `{act['price']:.6g}`\n"
+                    f"تم رفع الاستوب إلى `{act['new_sl']:.6g}`\n"
+                    f"المحفظة: *{pf.name if pf else '—'}*"
+                )
+                try:
+                    await context.bot.send_message(tid, msg, parse_mode="Markdown")
+                except Exception:
+                    pass
+
+            elif act["action"] == "tp2_hit":
+                update_coin_position(
+                    db, coin.id,
+                    position_status="tp2_hit",
+                    current_sl_price=act["new_sl"],
+                    tp2_order_id=None,
+                )
+                msg = (
+                    f"🎯 *تحقق الهدف 2* — `{symbol}`\n"
+                    f"السعر: `{act['price']:.6g}`\n"
+                    f"تم رفع الاستوب إلى `{act['new_sl']:.6g}`\n"
+                    f"المحفظة: *{pf.name if pf else '—'}*"
+                )
+                try:
+                    await context.bot.send_message(tid, msg, parse_mode="Markdown")
+                except Exception:
+                    pass
+
+            elif act["action"] == "tp3_hit":
+                update_coin_position(
+                    db, coin.id,
+                    position_status="tp3_hit",
+                    tp3_order_id=None,
+                )
+                msg = (
+                    f"🎯 *تحقق الهدف 3 (الأخير)* — `{symbol}`\n"
+                    f"السعر: `{act['price']:.6g}`\n"
                     f"المحفظة: *{pf.name if pf else '—'}*"
                 )
                 try:

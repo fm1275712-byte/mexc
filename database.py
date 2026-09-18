@@ -20,9 +20,16 @@ class UserSettings(Base):
     min_trade_usdt = Column(Float, default=5.0)
     max_coins_per_portfolio = Column(Integer, default=30)  # raised 10 → 30
     min_usdt_per_coin = Column(Float, default=5.0)
-    # TP / SL percentages (configurable from Telegram bot)
-    take_profit_pct = Column(Float, default=5.0)   # هدف الربح %
-    stop_loss_pct = Column(Float, default=3.0)     # وقف الخسارة %
+    # Multi TP + SL (configurable from Telegram bot)
+    tp1_pct = Column(Float, default=3.0)    # الهدف 1 %
+    tp2_pct = Column(Float, default=5.0)    # الهدف 2 %
+    tp3_pct = Column(Float, default=8.0)    # الهدف 3 %
+    tp1_sell_pct = Column(Float, default=40.0)  # نسبة البيع عند الهدف 1
+    tp2_sell_pct = Column(Float, default=30.0)  # نسبة البيع عند الهدف 2
+    # الباقي يُباع عند الهدف 3 أو يبقى مع الاستوب المرفوع
+    stop_loss_pct = Column(Float, default=3.0)
+    # legacy single field kept for migration compatibility
+    take_profit_pct = Column(Float, default=5.0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -60,13 +67,20 @@ class PortfolioCoin(Base):
     portfolio_id = Column(Integer, ForeignKey("portfolios.id"), nullable=False)
     symbol = Column(String(20), nullable=False)
     target_percent = Column(Float, default=0.0)
-    # Position tracking for TP/SL
+    # Position tracking for multi-TP / SL
     entry_price = Column(Float, default=0.0)
-    tp_price = Column(Float, default=0.0)
+    tp1_price = Column(Float, default=0.0)
+    tp2_price = Column(Float, default=0.0)
+    tp3_price = Column(Float, default=0.0)
+    tp_price = Column(Float, default=0.0)  # legacy / current next TP
     current_sl_price = Column(Float, default=0.0)
-    tp_order_id = Column(String(64), nullable=True)   # Limit sell order on MEXC
-    position_status = Column(String(20), default="idle")  # idle | open | tp_hit | closed
-    amount = Column(Float, default=0.0)  # quantity held after buy
+    tp1_order_id = Column(String(64), nullable=True)
+    tp2_order_id = Column(String(64), nullable=True)
+    tp3_order_id = Column(String(64), nullable=True)
+    tp_order_id = Column(String(64), nullable=True)  # legacy
+    position_status = Column(String(20), default="idle")  # idle | open | tp1_hit | tp2_hit | tp3_hit | closed
+    amount = Column(Float, default=0.0)
+    remaining_amount = Column(Float, default=0.0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     portfolio = relationship("Portfolio", back_populates="coins")
@@ -162,20 +176,34 @@ def init_db():
             for col, typ in [
                 ("entry_price", "DOUBLE PRECISION DEFAULT 0"),
                 ("tp_price", "DOUBLE PRECISION DEFAULT 0"),
+                ("tp1_price", "DOUBLE PRECISION DEFAULT 0"),
+                ("tp2_price", "DOUBLE PRECISION DEFAULT 0"),
+                ("tp3_price", "DOUBLE PRECISION DEFAULT 0"),
                 ("current_sl_price", "DOUBLE PRECISION DEFAULT 0"),
                 ("tp_order_id", "VARCHAR(64)"),
+                ("tp1_order_id", "VARCHAR(64)"),
+                ("tp2_order_id", "VARCHAR(64)"),
+                ("tp3_order_id", "VARCHAR(64)"),
                 ("position_status", "VARCHAR(20) DEFAULT 'idle'"),
                 ("amount", "DOUBLE PRECISION DEFAULT 0"),
+                ("remaining_amount", "DOUBLE PRECISION DEFAULT 0"),
             ]:
                 if col not in cols:
                     conn.execute(text(f"ALTER TABLE portfolio_coins ADD COLUMN {col} {typ}"))
 
         if "user_settings" in insp.get_table_names():
             cols = [c["name"] for c in insp.get_columns("user_settings")]
-            if "take_profit_pct" not in cols:
-                conn.execute(text("ALTER TABLE user_settings ADD COLUMN take_profit_pct DOUBLE PRECISION DEFAULT 5.0"))
-            if "stop_loss_pct" not in cols:
-                conn.execute(text("ALTER TABLE user_settings ADD COLUMN stop_loss_pct DOUBLE PRECISION DEFAULT 3.0"))
+            for col, default in [
+                ("take_profit_pct", "5.0"),
+                ("stop_loss_pct", "3.0"),
+                ("tp1_pct", "3.0"),
+                ("tp2_pct", "5.0"),
+                ("tp3_pct", "8.0"),
+                ("tp1_sell_pct", "40.0"),
+                ("tp2_sell_pct", "30.0"),
+            ]:
+                if col not in cols:
+                    conn.execute(text(f"ALTER TABLE user_settings ADD COLUMN {col} DOUBLE PRECISION DEFAULT {default}"))
             try:
                 conn.execute(text("UPDATE user_settings SET max_coins_per_portfolio = 30 WHERE max_coins_per_portfolio < 30 OR max_coins_per_portfolio IS NULL"))
             except Exception:
@@ -296,17 +324,24 @@ def reset_coin_positions(db, portfolio_id: int):
     for c in coins:
         c.entry_price = 0.0
         c.tp_price = 0.0
+        c.tp1_price = 0.0
+        c.tp2_price = 0.0
+        c.tp3_price = 0.0
         c.current_sl_price = 0.0
         c.tp_order_id = None
+        c.tp1_order_id = None
+        c.tp2_order_id = None
+        c.tp3_order_id = None
         c.position_status = "idle"
         c.amount = 0.0
+        c.remaining_amount = 0.0
     db.commit()
 
 
 def get_open_positions(db, telegram_id: int = None):
     """Return all coins with open positions (for the monitor job)."""
     q = db.query(PortfolioCoin).join(Portfolio).filter(
-        PortfolioCoin.position_status.in_(["open", "tp_hit"]),
+        PortfolioCoin.position_status.in_(["open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"]),
         Portfolio.is_running == True,
         Portfolio.status == "active",
     )
