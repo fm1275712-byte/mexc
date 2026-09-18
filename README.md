@@ -52,6 +52,24 @@ cp .env.example .env
 python bot.py
 ```
 
+## التشغيل على Railway
+
+هذا المشروع يعمل كـ **Worker** طويل التشغيل، وليس كخدمة HTTP. اترك أمر التشغيل:
+
+```bash
+python start.py
+```
+
+وأضف المتغيرات التالية في Railway:
+
+- `TELEGRAM_BOT_TOKEN`
+- `MEXC_API_KEY`
+- `MEXC_API_SECRET`
+- `DATABASE_URL` (أضف PostgreSQL إلى المشروع ثم استخدم متغير الاتصال)
+- `ADMIN_TELEGRAM_ID` (اختياري لكنه مستحسن)
+
+إذا كان البناء ناجحًا ثم توقف الـ Worker مباشرة، افتح Runtime Logs؛ سيظهر اسم أي متغير مطلوب غير موجود.
+
 ## طريقة الاستخدام
 
 1. أنشئ محافظك (إضافة عملات + مبلغ)
