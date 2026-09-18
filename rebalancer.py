@@ -303,6 +303,7 @@ class Rebalancer:
                 if not getattr(coin, "reentry_touched", False):
                     if price <= reentry:
                         actions.append({
+                            "coin_id": getattr(coin, "id", None),
                             "symbol": symbol,
                             "action": "reentry_touched",
                             "price": price,
@@ -313,6 +314,7 @@ class Rebalancer:
                 bounce = reentry * 1.01
                 if price >= bounce:
                     actions.append({
+                        "coin_id": getattr(coin, "id", None),
                         "symbol": symbol,
                         "action": "reentry_buy",
                         "price": price,
@@ -324,6 +326,7 @@ class Rebalancer:
             tp1_fill = self._filled_order_info(getattr(coin, "tp1_order_id", None), symbol)
             if status == "open" and tp1_fill:
                 actions.append({
+                    "coin_id": getattr(coin, "id", None),
                     "symbol": symbol,
                     "action": "tp1_hit",
                     # TP1 must move the stop to the original entry price
@@ -337,6 +340,7 @@ class Rebalancer:
             tp2_fill = self._filled_order_info(getattr(coin, "tp2_order_id", None), symbol)
             if status in ("open", "tp1_hit") and tp2_fill:
                 actions.append({
+                    "coin_id": getattr(coin, "id", None),
                     "symbol": symbol,
                     "action": "tp2_hit",
                     "new_sl": coin.tp2_price,
@@ -348,6 +352,7 @@ class Rebalancer:
             tp3_fill = self._filled_order_info(getattr(coin, "tp3_order_id", None), symbol)
             if status in ("open", "tp1_hit", "tp2_hit") and tp3_fill:
                 actions.append({
+                    "coin_id": getattr(coin, "id", None),
                     "symbol": symbol,
                     "action": "tp3_hit",
                     "price": price,
@@ -378,6 +383,7 @@ class Rebalancer:
                         sold = True
                     except Exception as e:
                         actions.append({
+                            "coin_id": getattr(coin, "id", None),
                             "symbol": symbol,
                             "action": "sl_sell_failed",
                             "error": str(e),
@@ -390,6 +396,7 @@ class Rebalancer:
                 # A stop creates a manual re-entry candidate. The user must
                 # explicitly choose whether to buy this coin again.
                 actions.append({
+                    "coin_id": getattr(coin, "id", None),
                     "symbol": symbol,
                     "action": "sl_hit_sold",
                     "sl": sl,

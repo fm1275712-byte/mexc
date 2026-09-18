@@ -2542,7 +2542,17 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
         )
         for act in actions:
             symbol = act["symbol"]
-            coin = next((c for c in positions if c.symbol == symbol), None)
+            coin_id = act.get("coin_id")
+            if coin_id is None:
+                # Compatibility with action payloads produced by older code.
+                coin = next((c for c in positions if c.symbol == symbol), None)
+            else:
+                # A symbol can exist in multiple portfolios. Always reload the
+                # exact row that produced the action, and skip it if a user
+                # removed it while this monitor cycle was running.
+                coin = db.query(PortfolioCoin).filter(
+                    PortfolioCoin.id == coin_id
+                ).first()
             if not coin:
                 continue
             pf = coin.portfolio
