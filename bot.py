@@ -93,6 +93,7 @@ def pf_keyboard(pf_id: int, is_running: bool):
     else:
         rows.append([InlineKeyboardButton("▶️ تشغيل", callback_data=f"start_{pf_id}")])
     rows.append([InlineKeyboardButton("📈 زيادة استثمار", callback_data=f"increase_{pf_id}")])
+    rows.append([InlineKeyboardButton("🎯 أهداف هذه المحفظة", callback_data=f"pf_tpsl_{pf_id}")])
     rows.append([
         InlineKeyboardButton("➕ عملة", callback_data=f"addcoin_{pf_id}"),
         InlineKeyboardButton("➖ عملة", callback_data=f"removecoin_{pf_id}"),
@@ -133,6 +134,18 @@ def format_pf(p) -> str:
         f"المخصص: `{p.investment_usdt:.2f}` USDT",
         f"العملات: `{coins}`",
     ]
+    # show portfolio-specific TP/SL if set
+    t1 = getattr(p, "tp1_pct", None)
+    t2 = getattr(p, "tp2_pct", None)
+    t3 = getattr(p, "tp3_pct", None)
+    sl = getattr(p, "stop_loss_pct", None)
+    if any(v is not None and v > 0 for v in (t1, t2, t3, sl)):
+        lines.append(
+            f"🎯 أهداف المحفظة: TP1 `{t1 or '—'}`% | TP2 `{t2 or '—'}`% | "
+            f"TP3 `{t3 or '—'}`% | SL `{sl or '—'}%`"
+        )
+    else:
+        lines.append("🎯 الأهداف: *من الإعدادات العامة*")
     if p.is_running:
         for c in p.coins:
             if c.position_status in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit") and c.entry_price:
@@ -591,7 +604,42 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if context.user_data.get("waiting"):
-        # Handle TP/SL percentage edit from settings
+        # Per-portfolio TP/SL edit
+        pf_edit = context.user_data.get("edit_pf_tpsl")
+        if pf_edit:
+            if not await ensure_admin(update):
+                return
+            try:
+                val = float(text.strip().replace("%", "").replace(",", "."))
+                if val < 0 or val > 100:
+                    await update.message.reply_text("أدخل رقم بين 0 و 100 (0 = استخدم العام).")
+                    return
+                db = SessionLocal()
+                try:
+                    pf = get_portfolio(db, pf_edit["pf_id"], update.effective_user.id)
+                    if not pf:
+                        await update.message.reply_text("المحفظة غير موجودة.")
+                        context.user_data.clear()
+                        return
+                    field = pf_edit["field"]
+                    setattr(pf, field, None if val == 0 else val)
+                    db.commit()
+                    await update.message.reply_text(
+                        f"✅ تم ضبط `{field}` للمحفظة *{pf.name}* إلى " + ("العام" if val == 0 else f"`{val}%`"),
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🎯 أهداف المحفظة", callback_data=f"pf_tpsl_{pf.id}")],
+                            [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf.id}")],
+                        ]),
+                    )
+                finally:
+                    db.close()
+                context.user_data.clear()
+            except ValueError:
+                await update.message.reply_text("أدخل رقم صحيح.")
+            return
+
+        # Handle TP/SL percentage edit from global settings
         edit_key = context.user_data.get("edit_setting")
         if edit_key in ("take_profit_pct", "stop_loss_pct", "tp1_pct", "tp2_pct", "tp3_pct", "tp1_sell_pct", "tp2_sell_pct"):
             if not await ensure_admin(update):
@@ -763,6 +811,96 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("stop_"):
         await _do_stop(query, tid, int(data.split("_")[1]))
         return
+
+    # Per-portfolio TP/SL settings
+    if data.startswith("pf_tpsl_"):
+        pf_id = int(data.split("_")[2])
+        db = SessionLocal()
+        try:
+            pf = get_portfolio(db, pf_id, tid)
+            if not pf:
+                await query.edit_message_text("غير موجودة.", reply_markup=main_menu_keyboard())
+                return
+            user = get_or_create_user(db, tid)
+            def show(v, default):
+                return f"`{v}`" if v is not None and float(v) > 0 else f"`{default}` (عام)"
+            t1 = getattr(pf, "tp1_pct", None)
+            t2 = getattr(pf, "tp2_pct", None)
+            t3 = getattr(pf, "tp3_pct", None)
+            s1 = getattr(pf, "tp1_sell_pct", None)
+            s2 = getattr(pf, "tp2_sell_pct", None)
+            sl = getattr(pf, "stop_loss_pct", None)
+            ut1 = getattr(user, "tp1_pct", 3.0) or 3.0
+            ut2 = getattr(user, "tp2_pct", 5.0) or 5.0
+            ut3 = getattr(user, "tp3_pct", 8.0) or 8.0
+            us1 = getattr(user, "tp1_sell_pct", 40.0) or 40.0
+            us2 = getattr(user, "tp2_sell_pct", 30.0) or 30.0
+            usl = getattr(user, "stop_loss_pct", 3.0) or 3.0
+            msg = (
+                f"🎯 *أهداف المحفظة:* {pf.name}\n\n"
+                f"TP1: {show(t1, ut1)}% | بيع: {show(s1, us1)}%\n"
+                f"TP2: {show(t2, ut2)}% | بيع: {show(s2, us2)}%\n"
+                f"TP3: {show(t3, ut3)}%\n"
+                f"استوب: {show(sl, usl)}%\n\n"
+                f"_لو فاضية = تستخدم الإعدادات العامة_"
+            )
+            await query.edit_message_text(
+                msg, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("TP1 %", callback_data=f"pftpsl_{pf_id}_tp1_pct"),
+                     InlineKeyboardButton("بيع 1 %", callback_data=f"pftpsl_{pf_id}_tp1_sell_pct")],
+                    [InlineKeyboardButton("TP2 %", callback_data=f"pftpsl_{pf_id}_tp2_pct"),
+                     InlineKeyboardButton("بيع 2 %", callback_data=f"pftpsl_{pf_id}_tp2_sell_pct")],
+                    [InlineKeyboardButton("TP3 %", callback_data=f"pftpsl_{pf_id}_tp3_pct"),
+                     InlineKeyboardButton("استوب %", callback_data=f"pftpsl_{pf_id}_stop_loss_pct")],
+                    [InlineKeyboardButton("🗑 امسح تخصيص المحفظة", callback_data=f"pftpsl_clear_{pf_id}")],
+                    [InlineKeyboardButton("⬅️ رجوع", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+        finally:
+            db.close()
+        return
+
+    if data.startswith("pftpsl_clear_"):
+        pf_id = int(data.split("_")[2])
+        db = SessionLocal()
+        try:
+            pf = get_portfolio(db, pf_id, tid)
+            if pf:
+                for f in ("tp1_pct", "tp2_pct", "tp3_pct", "tp1_sell_pct", "tp2_sell_pct", "stop_loss_pct"):
+                    setattr(pf, f, None)
+                db.commit()
+            await query.edit_message_text(
+                "✅ تم مسح تخصيص المحفظة — هتستخدم الإعدادات العامة.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data=f"pf_tpsl_{pf_id}")]]),
+            )
+        finally:
+            db.close()
+        return
+
+    if data.startswith("pftpsl_") and not data.startswith("pftpsl_clear_"):
+        # pftpsl_{id}_{field}
+        parts = data.split("_", 2)
+        # data = pftpsl_12_tp1_pct  -> need careful parse
+        rest = data[len("pftpsl_"):]  # 12_tp1_pct
+        pf_id_str, field = rest.split("_", 1)
+        pf_id = int(pf_id_str)
+        context.user_data["waiting"] = True
+        context.user_data["edit_pf_tpsl"] = {"pf_id": pf_id, "field": field}
+        labels = {
+            "tp1_pct": "هدف 1 %",
+            "tp2_pct": "هدف 2 %",
+            "tp3_pct": "هدف 3 %",
+            "tp1_sell_pct": "نسبة البيع عند الهدف 1",
+            "tp2_sell_pct": "نسبة البيع عند الهدف 2",
+            "stop_loss_pct": "وقف الخسارة %",
+        }
+        await query.edit_message_text(
+            f"أرسل قيمة *{labels.get(field, field)}* لهذه المحفظة:\n(أو `0` لمسح التخصيص واستخدام العام)",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data=f"pf_tpsl_{pf_id}")]]),
+        )
+        return
     if data.startswith("increase_"):
         context.user_data["increase_pf"] = int(data.split("_")[1])
         context.user_data["waiting"] = True
@@ -920,12 +1058,19 @@ async def _do_start(query, tid, pf_id):
             await query.edit_message_text("المحفظة شغالة مسبقاً.", reply_markup=pf_keyboard(pf_id, True))
             return
         user = get_or_create_user(db, tid)
-        tp1 = getattr(user, "tp1_pct", 3.0) or 3.0
-        tp2 = getattr(user, "tp2_pct", 5.0) or 5.0
-        tp3 = getattr(user, "tp3_pct", 8.0) or 8.0
-        s1 = getattr(user, "tp1_sell_pct", 40.0) or 40.0
-        s2 = getattr(user, "tp2_sell_pct", 30.0) or 30.0
-        sl_pct = getattr(user, "stop_loss_pct", 3.0) or 3.0
+        # Portfolio-specific overrides, else user defaults
+        def _pct(pf_val, user_val, default):
+            if pf_val is not None and float(pf_val) > 0:
+                return float(pf_val)
+            if user_val is not None and float(user_val) > 0:
+                return float(user_val)
+            return default
+        tp1 = _pct(getattr(p, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
+        tp2 = _pct(getattr(p, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
+        tp3 = _pct(getattr(p, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
+        s1 = _pct(getattr(p, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
+        s2 = _pct(getattr(p, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 30.0)
+        sl_pct = _pct(getattr(p, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
 
         await query.edit_message_text("⏳ جاري الشراء...")
         result = get_reb().start_portfolio(
@@ -967,12 +1112,16 @@ async def _do_start(query, tid, pf_id):
                 tp3_price=r.get("tp3_price", 0),
                 tp_price=r.get("tp1_price", 0),
                 current_sl_price=r.get("sl_price", 0),
+                original_sl_price=r.get("original_sl_price") or r.get("sl_price", 0),
                 amount=r.get("amount", 0),
                 remaining_amount=r.get("amount", 0),
                 tp1_order_id=r.get("tp1_order_id"),
                 tp2_order_id=r.get("tp2_order_id"),
                 tp3_order_id=r.get("tp3_order_id"),
                 position_status="open",
+                reentry_used=False,
+                reentry_touched=False,
+                reentry_price=0.0,
             )
             if r.get("error"):
                 lines.append(f"⚠️ `{r['symbol']}`: {r['error']}")
@@ -1335,6 +1484,104 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(tid, msg, parse_mode="Markdown")
                 except Exception:
                     pass
+
+            elif act["action"] == "sl_hit_wait_reentry":
+                update_coin_position(
+                    db, coin.id,
+                    position_status="waiting_reentry",
+                    current_sl_price=0.0,
+                    tp1_order_id=None,
+                    tp2_order_id=None,
+                    tp3_order_id=None,
+                    amount=0.0,
+                    reentry_price=act["reentry_price"],
+                    reentry_touched=False,
+                    reentry_used=False,
+                )
+                msg = (
+                    f"🛡 *ضرب الاستوب المرفوع* — `{symbol}`\n"
+                    f"تم البيع ≈ `{act['price']:.6g}`\n"
+                    f"⏳ انتظار إعادة دخول عند الاستوب الأصلي `{act['reentry_price']:.6g}`\n"
+                    f"(لمس + ارتداد 1%)\n"
+                    f"المحفظة: *{pf.name if pf else '—'}*"
+                )
+                try:
+                    await context.bot.send_message(tid, msg, parse_mode="Markdown")
+                except Exception:
+                    pass
+
+            elif act["action"] == "reentry_touched":
+                update_coin_position(db, coin.id, reentry_touched=True)
+                msg = (
+                    f"📍 *لمس منطقة إعادة الدخول* — `{symbol}`\n"
+                    f"السعر `{act['price']:.6g}` ≤ `{act['reentry_price']:.6g}`\n"
+                    f"في انتظار ارتداد +1% للشراء..."
+                )
+                try:
+                    await context.bot.send_message(tid, msg, parse_mode="Markdown")
+                except Exception:
+                    pass
+
+            elif act["action"] == "reentry_buy":
+                # buy again with equal share of portfolio investment
+                user = get_or_create_user(db, tid)
+                def _pct(pf_val, user_val, default):
+                    if pf_val is not None and float(pf_val) > 0:
+                        return float(pf_val)
+                    if user_val is not None and float(user_val) > 0:
+                        return float(user_val)
+                    return default
+                tp1 = _pct(getattr(pf, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
+                tp2 = _pct(getattr(pf, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
+                tp3 = _pct(getattr(pf, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
+                s1 = _pct(getattr(pf, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
+                s2 = _pct(getattr(pf, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 30.0)
+                sl_pct = _pct(getattr(pf, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
+                n_coins = max(1, len(pf.coins) if pf else 1)
+                usdt = (pf.investment_usdt if pf else 20) / n_coins
+                buy_res = get_reb().reentry_buy_and_place_tp(
+                    symbol, usdt, tp1, tp2, tp3, sl_pct, s1, s2
+                )
+                if buy_res.get("error"):
+                    try:
+                        await context.bot.send_message(
+                            tid, f"⚠️ فشل إعادة دخول `{symbol}`: `{buy_res['error']}`", parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+                else:
+                    update_coin_position(
+                        db, coin.id,
+                        entry_price=buy_res.get("entry_price", act["price"]),
+                        tp1_price=buy_res.get("tp1_price", 0),
+                        tp2_price=buy_res.get("tp2_price", 0),
+                        tp3_price=buy_res.get("tp3_price", 0),
+                        current_sl_price=buy_res.get("sl_price", 0),
+                        original_sl_price=buy_res.get("original_sl_price") or buy_res.get("sl_price", 0),
+                        amount=buy_res.get("amount", 0),
+                        remaining_amount=buy_res.get("amount", 0),
+                        tp1_order_id=buy_res.get("tp1_order_id"),
+                        tp2_order_id=buy_res.get("tp2_order_id"),
+                        tp3_order_id=buy_res.get("tp3_order_id"),
+                        position_status="open",
+                        reentry_used=True,
+                        reentry_touched=False,
+                        reentry_price=0.0,
+                    )
+                    msg = (
+                        f"🔄 *إعادة دخول* — `{symbol}`\n"
+                        f"شراء عند ≈ `{buy_res.get('entry_price', act['price']):.6g}`\n"
+                        f"TP1 `{buy_res.get('tp1_price', 0):.6g}` | "
+                        f"TP2 `{buy_res.get('tp2_price', 0):.6g}` | "
+                        f"TP3 `{buy_res.get('tp3_price', 0):.6g}`\n"
+                        f"SL `{buy_res.get('sl_price', 0):.6g}`\n"
+                        f"(مرة واحدة فقط لهذه الدورة)\n"
+                        f"المحفظة: *{pf.name if pf else '—'}*"
+                    )
+                    try:
+                        await context.bot.send_message(tid, msg, parse_mode="Markdown")
+                    except Exception:
+                        pass
 
             elif act["action"] == "sl_hit_sold":
                 update_coin_position(

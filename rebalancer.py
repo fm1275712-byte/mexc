@@ -168,6 +168,7 @@ class Rebalancer:
                 "tp2_price": tp2,
                 "tp3_price": tp3,
                 "sl_price": sl,
+                "original_sl_price": sl,
                 "amount": amount,
                 "remaining_amount": amount,
                 **orders,
@@ -202,17 +203,17 @@ class Rebalancer:
 
     def check_and_manage_positions(self, positions: List[Any]) -> List[Dict]:
         """
-        Multi-TP monitor:
-        TP1 → raise SL to TP1
-        TP2 → raise SL to TP2
-        TP3 → mark done
-        SL hit → cancel limits + market sell remaining
+        Multi-TP + smart re-entry:
+        - TP1/2/3 hits raise SL stepwise
+        - Raised SL hit after TP → sell + wait for re-entry at original SL
+        - Original SL touch then +1% bounce → buy once, new cycle
+        - Initial SL hit before any TP → sell and close (no re-entry)
         """
         actions = []
         for coin in positions:
             symbol = coin.symbol
             status = coin.position_status or "idle"
-            if status not in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"):
+            if status not in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit", "waiting_reentry"):
                 continue
             try:
                 price = self.client.get_ticker_price(f"{symbol}/{self.quote}")
@@ -221,6 +222,35 @@ class Rebalancer:
             if price <= 0:
                 continue
 
+            # ----- waiting for re-entry -----
+            if status == "waiting_reentry":
+                if getattr(coin, "reentry_used", False):
+                    continue
+                reentry = float(getattr(coin, "reentry_price", 0) or 0)
+                if reentry <= 0:
+                    continue
+                # Step 1: touch the zone (price <= reentry)
+                if not getattr(coin, "reentry_touched", False):
+                    if price <= reentry:
+                        actions.append({
+                            "symbol": symbol,
+                            "action": "reentry_touched",
+                            "price": price,
+                            "reentry_price": reentry,
+                        })
+                    continue
+                # Step 2: bounce +1% above reentry → buy again
+                bounce = reentry * 1.01
+                if price >= bounce:
+                    actions.append({
+                        "symbol": symbol,
+                        "action": "reentry_buy",
+                        "price": price,
+                        "reentry_price": reentry,
+                    })
+                continue
+
+            # ----- normal TP detection -----
             if status == "open" and self._order_filled(getattr(coin, "tp1_order_id", None), symbol):
                 actions.append({
                     "symbol": symbol,
@@ -241,6 +271,7 @@ class Rebalancer:
                 actions.append({"symbol": symbol, "action": "tp3_hit", "price": price})
                 continue
 
+            # ----- stop loss -----
             sl = float(coin.current_sl_price or 0)
             if sl > 0 and price <= sl:
                 for oid in (
@@ -268,13 +299,59 @@ class Rebalancer:
                             "price": price,
                         })
                         continue
-                actions.append({
-                    "symbol": symbol,
-                    "action": "sl_hit_sold",
-                    "sl": sl,
-                    "price": price,
-                    "amount": amount,
-                    "sold": sold,
-                    "was_raised": status in ("tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"),
-                })
+
+                was_raised = status in ("tp1_hit", "tp2_hit", "tp3_hit", "tp_hit")
+                orig_sl = float(getattr(coin, "original_sl_price", 0) or 0)
+                # Smart re-entry only if we already took profit (raised SL) and have original SL
+                if was_raised and orig_sl > 0 and not getattr(coin, "reentry_used", False):
+                    actions.append({
+                        "symbol": symbol,
+                        "action": "sl_hit_wait_reentry",
+                        "sl": sl,
+                        "price": price,
+                        "amount": amount,
+                        "sold": sold,
+                        "reentry_price": orig_sl,
+                    })
+                else:
+                    actions.append({
+                        "symbol": symbol,
+                        "action": "sl_hit_sold",
+                        "sl": sl,
+                        "price": price,
+                        "amount": amount,
+                        "sold": sold,
+                        "was_raised": was_raised,
+                    })
         return actions
+
+    def reentry_buy_and_place_tp(
+        self,
+        symbol: str,
+        usdt_amount: float,
+        tp1_pct: float,
+        tp2_pct: float,
+        tp3_pct: float,
+        stop_loss_pct: float,
+        tp1_sell_pct: float = 40.0,
+        tp2_sell_pct: float = 30.0,
+    ) -> Dict:
+        """Market buy then place multi-TP limits for a re-entry."""
+        result = {"symbol": symbol, "error": None}
+        try:
+            order = self.client.create_market_buy_usdt(symbol, usdt_amount)
+            result["buy_order_id"] = order.get("id") if order else None
+        except Exception as e:
+            result["error"] = str(e)
+            return result
+        import time
+        time.sleep(1.0)
+        amount = self.client.get_free_amount(symbol) * 0.998
+        entry = self.client.get_ticker_price(f"{symbol}/{self.quote}")
+        placed = self.place_tp_orders(
+            [{"symbol": symbol, "amount": amount, "entry_price": entry}],
+            tp1_pct, tp2_pct, tp3_pct, stop_loss_pct, tp1_sell_pct, tp2_sell_pct,
+        )
+        if placed:
+            result.update(placed[0])
+        return result

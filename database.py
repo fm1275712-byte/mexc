@@ -50,6 +50,14 @@ class Portfolio(Base):
     threshold = Column(Float, default=2.0)
     rebalance_interval_hours = Column(Integer, default=24)
 
+    # Per-portfolio TP/SL (None/0 = use user defaults)
+    tp1_pct = Column(Float, nullable=True)
+    tp2_pct = Column(Float, nullable=True)
+    tp3_pct = Column(Float, nullable=True)
+    tp1_sell_pct = Column(Float, nullable=True)
+    tp2_sell_pct = Column(Float, nullable=True)
+    stop_loss_pct = Column(Float, nullable=True)
+
     last_rebalance = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
     stopped_at = Column(DateTime, nullable=True)
@@ -81,6 +89,10 @@ class PortfolioCoin(Base):
     position_status = Column(String(20), default="idle")  # idle | open | tp1_hit | tp2_hit | tp3_hit | closed
     amount = Column(Float, default=0.0)
     remaining_amount = Column(Float, default=0.0)
+    original_sl_price = Column(Float, default=0.0)  # initial SL, used for re-entry
+    reentry_price = Column(Float, default=0.0)
+    reentry_used = Column(Boolean, default=False)   # only one re-entry per cycle
+    reentry_touched = Column(Boolean, default=False)  # price touched reentry zone
     created_at = Column(DateTime, default=datetime.utcnow)
 
     portfolio = relationship("Portfolio", back_populates="coins")
@@ -168,6 +180,9 @@ def init_db():
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN stopped_at TIMESTAMP"))
             if "base_investment" not in cols:
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN base_investment DOUBLE PRECISION DEFAULT 0"))
+            for col in ("tp1_pct", "tp2_pct", "tp3_pct", "tp1_sell_pct", "tp2_sell_pct", "stop_loss_pct"):
+                if col not in cols:
+                    conn.execute(text(f"ALTER TABLE portfolios ADD COLUMN {col} DOUBLE PRECISION"))
 
         if "portfolio_coins" in insp.get_table_names():
             cols = [c["name"] for c in insp.get_columns("portfolio_coins")]
@@ -187,6 +202,10 @@ def init_db():
                 ("position_status", "VARCHAR(20) DEFAULT 'idle'"),
                 ("amount", "DOUBLE PRECISION DEFAULT 0"),
                 ("remaining_amount", "DOUBLE PRECISION DEFAULT 0"),
+                ("original_sl_price", "DOUBLE PRECISION DEFAULT 0"),
+                ("reentry_price", "DOUBLE PRECISION DEFAULT 0"),
+                ("reentry_used", "BOOLEAN DEFAULT FALSE"),
+                ("reentry_touched", "BOOLEAN DEFAULT FALSE"),
             ]:
                 if col not in cols:
                     conn.execute(text(f"ALTER TABLE portfolio_coins ADD COLUMN {col} {typ}"))
@@ -335,13 +354,17 @@ def reset_coin_positions(db, portfolio_id: int):
         c.position_status = "idle"
         c.amount = 0.0
         c.remaining_amount = 0.0
+        c.original_sl_price = 0.0
+        c.reentry_price = 0.0
+        c.reentry_used = False
+        c.reentry_touched = False
     db.commit()
 
 
 def get_open_positions(db, telegram_id: int = None):
     """Return all coins with open positions (for the monitor job)."""
     q = db.query(PortfolioCoin).join(Portfolio).filter(
-        PortfolioCoin.position_status.in_(["open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"]),
+        PortfolioCoin.position_status.in_(["open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit", "waiting_reentry"]),
         Portfolio.is_running == True,
         Portfolio.status == "active",
     )
