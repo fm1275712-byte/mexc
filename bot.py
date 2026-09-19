@@ -1640,98 +1640,117 @@ async def _do_rebuild_positions(query, tid, pf_id):
             parse_mode="Markdown",
         )
 
-        # 2) Detect actual balances
+        # 2) Detect actual balances + equal target allocation
+        # مثال: تخصيص 100$ و 20 عملة → هدف كل عملة = 5$
         presence = client.get_portfolio_presence(symbols)
         min_usdt = float(getattr(config, "BALANCE_PRESENCE_MIN_USDT", 1.0))
-        present = []
-        missing = []
+        allocated = float(p.investment_usdt or 0)
+        n_coins = len(p.coins)
+        target_per_coin = allocated / n_coins if n_coins > 0 else 0.0
+
+        coin_status = []  # (coin, amount, price, market_value, need_buy_usdt)
         for coin in p.coins:
             info = presence.get(coin.symbol) or presence.get(coin.symbol.upper()) or {}
             val = float(info.get("market_value") or 0)
             amt = float(info.get("amount") or 0)
-            if amt > 0 and val >= min_usdt:
-                present.append((coin, amt, float(info.get("price") or 0), val))
+            price = float(info.get("price") or 0)
+            # لو القيمة أقل من 90% من الهدف → نكمّل الفرق
+            if val < target_per_coin * 0.90:
+                need = max(0.0, target_per_coin - val)
             else:
-                missing.append(coin)
+                need = 0.0
+            # لو تقريباً صفر نعتبرها ناقصة كاملة
+            if amt <= 0 or val < min_usdt:
+                need = target_per_coin
+                val = 0.0
+                amt = 0.0
+            coin_status.append((coin, amt, price, val, need))
 
-        # 3) Buy missing coins with remaining capital
+        under = [x for x in coin_status if x[4] >= 3.0]  # يحتاج شراء ≥ 3$
+        ok_coins = [x for x in coin_status if x[4] < 3.0]
+
+        await query.edit_message_text(
+            f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"① أُلغي `{cancelled_count}` أمر قديم\n"
+            f"② التخصيص: `{allocated:.0f}$` ÷ `{n_coins}` = *`{target_per_coin:.2f}$`* لكل عملة\n"
+            f"ناقص/تحت الهدف: `{len(under)}` | مكتمل: `{len(ok_coins)}`\n"
+            "③ إعادة توزيع وشراء الناقص...",
+            parse_mode="Markdown",
+        )
+
+        # 3) Buy the shortfall for each under-allocated coin
         bought = []
+        topped = []
         buy_errors = []
-        allocated = float(p.investment_usdt or 0)
-        current_total = sum(v for _, _, _, v in present)
-        remaining_budget = max(0.0, allocated - current_total)
+        free_usdt = client.get_free_usdt()
 
-        if missing and remaining_budget >= 5.0:
-            per_coin = remaining_budget / len(missing)
-            # Don't buy if share is too tiny
-            if per_coin < 3.0:
-                buy_errors.append(f"الميزانية المتبقية `{remaining_budget:.2f}$` صغيرة جداً لـ {len(missing)} عملة")
-            else:
-                await query.edit_message_text(
-                    f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    f"① أُلغي `{cancelled_count}` أمر\n"
-                    f"② موجودة: `{len(present)}` | ناقصة: `{len(missing)}`\n"
-                    f"③ شراء الناقص (`{per_coin:.2f}$` لكل عملة)...",
-                    parse_mode="Markdown",
+        for coin, amt, price, val, need in under:
+            buy_amt = min(need, free_usdt * 0.98)
+            if buy_amt < 3.0:
+                buy_errors.append(f"{coin.symbol}: رصيد USDT غير كافٍ (`{free_usdt:.2f}`)")
+                continue
+            try:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda c=coin, a=buy_amt: reb.reentry_buy_and_place_tp(
+                        c.symbol, a, tp1, tp2, tp3, sl_pct, s1, s2,
+                    ),
                 )
-                for coin in missing:
-                    try:
-                        result = await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda c=coin, amt=per_coin: reb.reentry_buy_and_place_tp(
-                                c.symbol, amt, tp1, tp2, tp3, sl_pct, s1, s2,
-                            ),
-                        )
-                        if result.get("error"):
-                            buy_errors.append(f"{coin.symbol}: {result['error']}")
-                            continue
-                        entry = float(result.get("entry_price") or 0)
-                        amount = float(result.get("amount") or result.get("remaining_amount") or 0)
-                        update_coin_position(
-                            db, coin.id,
-                            entry_price=entry,
-                            amount=amount,
-                            remaining_amount=amount,
-                            tp1_price=result.get("tp1_price", 0),
-                            tp2_price=result.get("tp2_price", 0),
-                            tp3_price=result.get("tp3_price", 0),
-                            tp_price=result.get("tp1_price", 0),
-                            current_sl_price=result.get("sl_price", 0),
-                            original_sl_price=result.get("original_sl_price", 0),
-                            tp1_order_id=result.get("tp1_order_id"),
-                            tp2_order_id=result.get("tp2_order_id"),
-                            tp3_order_id=result.get("tp3_order_id"),
-                            position_status="open",
-                            reentry_used=False,
-                            reentry_touched=False,
-                        )
-                        mark_reentry_events_used(db, p.id, coin.symbol)
-                        bought.append(coin.symbol)
-                        present.append((coin, amount, entry, amount * entry if entry else 0))
-                    except Exception as exc:
-                        buy_errors.append(f"{coin.symbol}: {exc}")
-                    time.sleep(0.4)
+                if result.get("error"):
+                    buy_errors.append(f"{coin.symbol}: {result['error']}")
+                    continue
+                entry = float(result.get("entry_price") or 0)
+                amount = float(result.get("amount") or result.get("remaining_amount") or 0)
+                update_coin_position(
+                    db, coin.id,
+                    entry_price=entry,
+                    amount=amount,
+                    remaining_amount=amount,
+                    tp1_price=result.get("tp1_price", 0),
+                    tp2_price=result.get("tp2_price", 0),
+                    tp3_price=result.get("tp3_price", 0),
+                    tp_price=result.get("tp1_price", 0),
+                    current_sl_price=result.get("sl_price", 0),
+                    original_sl_price=result.get("original_sl_price", 0),
+                    tp1_order_id=result.get("tp1_order_id"),
+                    tp2_order_id=result.get("tp2_order_id"),
+                    tp3_order_id=result.get("tp3_order_id"),
+                    position_status="open",
+                    reentry_used=False,
+                    reentry_touched=False,
+                )
+                mark_reentry_events_used(db, p.id, coin.symbol)
+                if val < min_usdt:
+                    bought.append(coin.symbol)
+                else:
+                    topped.append(f"{coin.symbol}(+{buy_amt:.1f}$)")
+                free_usdt = max(0.0, free_usdt - buy_amt)
+            except Exception as exc:
+                buy_errors.append(f"{coin.symbol}: {exc}")
+            time.sleep(0.4)
 
-        # 4) Re-place TP/SL for coins that already had balance (and weren't just bought)
+        # 4) Re-place TP/SL for coins that already had enough balance
         await query.edit_message_text(
             f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"① أُلغي `{cancelled_count}` أمر\n"
-            f"② موجودة: `{len(present)}` | اشتريت: `{len(bought)}`\n"
-            "④ إعادة وضع الأهداف...",
+            f"② هدف كل عملة: `{target_per_coin:.2f}$`\n"
+            f"③ اشتريت: `{len(bought)}` | كمّلت: `{len(topped)}`\n"
+            "④ إعادة وضع الأهداف للباقي...",
             parse_mode="Markdown",
         )
 
-        refreshed = []
+        refreshed = list(bought)  # already have TP from reentry_buy
         refresh_errors = []
-        bought_set = set(bought)
-        for coin, amt, price, val in present:
-            if coin.symbol in bought_set:
-                refreshed.append(coin.symbol)  # already placed during buy
+        already_done = set(bought) | {t.split("(")[0] for t in topped}
+
+        for coin, amt, price, val, need in coin_status:
+            if coin.symbol in already_done:
+                if coin.symbol not in refreshed:
+                    refreshed.append(coin.symbol)
                 continue
             try:
-                # Prefer free amount for placing new limits; unlock first already done
                 free_amt = client.get_free_amount(coin.symbol)
                 use_amt = free_amt if free_amt > 0 else amt
                 use_amt = use_amt * 0.998
@@ -1769,7 +1788,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
 
         log_action(
             db, tid, "rebuild_positions",
-            f"Rebuild {p.name}: cancel={cancelled_count} buy={bought} refresh={refreshed}",
+            f"Rebuild {p.name}: target={target_per_coin:.2f} cancel={cancelled_count} buy={bought} top={topped}",
             not (buy_errors or refresh_errors),
             pf_id,
         )
@@ -1778,10 +1797,12 @@ async def _do_rebuild_positions(query, tid, pf_id):
         lines = [
             f"✅ *تمت إعادة بناء مراكز* `{p.name}`",
             "━━━━━━━━━━━━━━━━━━━━",
+            f"💰 التخصيص: `{allocated:.0f}$` ÷ `{n_coins}` عملة = *`{target_per_coin:.2f}$`* لكل واحدة",
             f"🗑 أوامر قديمة ملغاة: `{cancelled_count}`",
-            f"🛒 عملات اشتريت: `{len(bought)}`" + (f" — {', '.join(f'`{x}`' for x in bought)}" if bought else ""),
-            f"🎯 أهداف وُضعت لـ: `{len(refreshed)}`" + (f" — {', '.join(f'`{x}`' for x in refreshed[:12])}" if refreshed else ""),
-            f"القيم: TP1 `{tp1}%` · TP2 `{tp2}%` · TP3 `{tp3}%` · SL `{sl_pct}%`",
+            f"🛒 عملات جديدة: `{len(bought)}`" + (f" — {', '.join(f'`{x}`' for x in bought)}" if bought else ""),
+            f"📈 تم تكميل: `{len(topped)}`" + (f" — {', '.join(f'`{x}`' for x in topped[:8])}" if topped else ""),
+            f"🎯 أهداف وُضعت لـ: `{len(refreshed)}` عملة",
+            f"TP1 `{tp1}%` · TP2 `{tp2}%` · TP3 `{tp3}%` · SL `{sl_pct}%`",
         ]
         all_errs = cancel_errors[:3] + buy_errors + refresh_errors
         if all_errs:
