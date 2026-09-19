@@ -260,8 +260,9 @@ class MexcClient:
     def create_limit_sell(self, symbol: str, amount: float, price: float) -> Optional[dict]:
         """Place a limit sell order (used for Take Profit visible on MEXC).
 
-        Returns None (without raising) when the amount is below the exchange
-        minimum precision so tiny dust positions do not spam errors.
+        Returns None (without raising) when amount/notional is below exchange
+        minimums so tiny dust positions do not spam errors.
+        MEXC typically requires min notional ≈ 1 USDT.
         """
         pair = f"{symbol}/{self.quote}"
         try:
@@ -269,7 +270,11 @@ class MexcClient:
             if not getattr(self.exchange, "markets", None):
                 self.exchange.load_markets()
             market = self.exchange.market(pair)
-            min_amount = float((market.get("limits") or {}).get("amount", {}).get("min") or 0)
+            limits = market.get("limits") or {}
+            min_amount = float((limits.get("amount") or {}).get("min") or 0)
+            min_cost = float((limits.get("cost") or {}).get("min") or 1.0)  # MEXC ≈ 1 USDT
+            if min_cost <= 0:
+                min_cost = 1.0
             precision_amount = market.get("precision", {}).get("amount")
             # Round down to exchange precision
             amount = float(self.exchange.amount_to_precision(pair, amount))
@@ -277,6 +282,9 @@ class MexcClient:
             if amount <= 0 or price <= 0:
                 return None
             if min_amount > 0 and amount < min_amount:
+                return None
+            notional = amount * price
+            if notional < min_cost:
                 return None
             # Some MEXC pairs treat precision as minimum step
             if precision_amount is not None:
@@ -296,8 +304,12 @@ class MexcClient:
             return order
         except Exception as e:
             msg = str(e).lower()
-            # Treat precision / minimum amount errors as skippable
-            if any(x in msg for x in ("minimum amount", "min amount", "precision", "too small")):
+            # Treat precision / minimum amount / min volume errors as skippable
+            if any(x in msg for x in (
+                "minimum amount", "min amount", "precision", "too small",
+                "minimum transaction", "cannot be less", "min notional",
+                "30002",
+            )):
                 return None
             raise Exception(f"Limit sell failed for {pair}: {str(e)}")
 

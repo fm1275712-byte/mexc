@@ -169,15 +169,35 @@ class Rebalancer:
                 ("tp3", "tp3_order_id", tp3, max(0.0, 100.0 - tp1_sell_pct - tp2_sell_pct)),
             ]
             active = [stage for stage in planned if stage[0] not in skipped and stage[3] > 0]
-            active_weight = sum(stage[3] for stage in active)
+            # فلترة الشرائح اللي قيمتها أقل من 1 USDT ودمج وزنها في آخر شريحة صالحة
+            MIN_NOTIONAL = 1.05  # هامش فوق حد MEXC (1 USDT)
+            viable = []
+            leftover_weight = 0.0
+            total_weight = sum(s[3] for s in active) or 1.0
             for stage, key, price, weight in active:
+                qty = amount * (weight / total_weight)
+                notional = qty * price
+                if notional < MIN_NOTIONAL:
+                    leftover_weight += weight
+                else:
+                    viable.append([stage, key, price, weight])
+            if viable and leftover_weight > 0:
+                # ادمج الوزن الصغير في آخر هدف صالح
+                viable[-1][3] += leftover_weight
+            elif not viable and active:
+                # كل الشرائح صغيرة → حط أمر واحد على أقرب هدف (TP1 أو أول متاح)
+                stage, key, price, weight = active[0]
+                viable = [[stage, key, price, total_weight]]
+
+            active_weight = sum(s[3] for s in viable) or 1.0
+            for stage, key, price, weight in viable:
                 qty = amount * (weight / active_weight) if active_weight > 0 else 0.0
                 if qty <= 0:
                     continue
                 try:
                     order = self.client.create_limit_sell(symbol, qty, price)
                     if order is None:
-                        # Amount below exchange minimum — skip quietly
+                        # أقل من الحد الأدنى — تجاوز بهدوء
                         continue
                     orders[key] = order.get("id") if order else None
                 except Exception as e:
