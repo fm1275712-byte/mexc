@@ -176,47 +176,42 @@ def source_detail_keyboard(src_id: int, enabled: bool):
     return InlineKeyboardMarkup(rows)
 
 
-def format_pf(p) -> str:
-    coins = ", ".join(c.symbol for c in p.coins) or "—"
-    status = "🟢 *شغالة*" if p.is_running else "⚪ *متوقفة*"
+def format_pf(p, current_value: float = None) -> str:
+    """عرض محفظة مختصر وأنيق: اسم + حالة + مخصص + قيمة + نسبة + العملات."""
+    status = "🟢 شغالة" if p.is_running else "⚪ متوقفة"
+    allocated = float(p.investment_usdt or 0)
+
+    # نسبة الربح/الخسارة
+    pnl_line = ""
+    if current_value is not None and allocated > 0:
+        pnl = current_value - allocated
+        pct = (pnl / allocated) * 100
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        pnl_line = f"{emoji} الربح/الخسارة: `{pnl:+.2f}` USDT  (`{pct:+.2f}%`)"
+
+    # العملات في صفوف منظمة (4 في السطر)
+    symbols = [c.symbol for c in p.coins]
+    if symbols:
+        rows = []
+        for i in range(0, len(symbols), 4):
+            chunk = symbols[i:i + 4]
+            rows.append("  ".join(f"`{s}`" for s in chunk))
+        coins_block = "\n".join(rows)
+    else:
+        coins_block = "—"
+
     lines = [
         f"📁 *{p.name}*  `#{p.id}`",
-        "━━━━━━━━━━━━━━━━",
-        f"الحالة: {status}",
-        f"المخصص: `{p.investment_usdt:.2f}` USDT",
-        f"العملات ({len(p.coins)}): `{coins}`",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"الحالة: *{status}*",
+        f"المخصص: `{allocated:.2f}` USDT",
     ]
-    # show portfolio-specific TP/SL if set
-    t1 = getattr(p, "tp1_pct", None)
-    t2 = getattr(p, "tp2_pct", None)
-    t3 = getattr(p, "tp3_pct", None)
-    sl = getattr(p, "stop_loss_pct", None)
-    if any(v is not None and v > 0 for v in (t1, t2, t3, sl)):
-        lines.append(
-            f"🎯 أهداف: TP1 `{t1 or '—'}%` · TP2 `{t2 or '—'}%` · "
-            f"TP3 `{t3 or '—'}%` · SL `{sl or '—'}%`"
-        )
-    else:
-        lines.append("🎯 الأهداف: *من الإعدادات العامة*")
-    if p.is_running:
-        lines.append("")
-        lines.append("*المراكز المفتوحة:*")
-        for c in p.coins:
-            if c.position_status in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit") and c.entry_price:
-                st_map = {
-                    "open": "مفتوح",
-                    "tp1_hit": "TP1 ✓",
-                    "tp2_hit": "TP2 ✓",
-                    "tp3_hit": "TP3 ✓",
-                    "tp_hit": "هدف ✓",
-                }
-                st = st_map.get(c.position_status, c.position_status)
-                lines.append(
-                    f"• `{c.symbol}` دخول `{c.entry_price:.6g}`\n"
-                    f"  TP1 `{getattr(c,'tp1_price',0):.6g}` · TP2 `{getattr(c,'tp2_price',0):.6g}` · "
-                    f"TP3 `{getattr(c,'tp3_price',0):.6g}`\n"
-                    f"  🛑 استوب `{c.current_sl_price:.6g}` ({st})"
-                )
+    if current_value is not None:
+        lines.append(f"القيمة الحالية: `{current_value:.2f}` USDT")
+    if pnl_line:
+        lines.append(pnl_line)
+    lines.append(f"العملات ({len(symbols)}):")
+    lines.append(coins_block)
     return "\n".join(lines)
 
 
@@ -1092,14 +1087,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
                 return
             coins = [c.symbol for c in p.coins]
-            live = ""
+            current_value = None
             if coins:
                 try:
                     val = get_mexc().get_coins_value(coins)
-                    live = f"\nالقيمة الحالية: `{val['total_usdt']:.2f}` USDT"
+                    current_value = float(val.get("total_usdt") or 0)
                 except Exception:
-                    pass
-            await query.edit_message_text(format_pf(p) + live, parse_mode="Markdown", reply_markup=pf_keyboard(p.id, p.is_running))
+                    current_value = None
+            await query.edit_message_text(
+                format_pf(p, current_value=current_value),
+                parse_mode="Markdown",
+                reply_markup=pf_keyboard(p.id, p.is_running),
+            )
         finally:
             db.close()
         return
