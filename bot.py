@@ -1640,55 +1640,65 @@ async def _do_rebuild_positions(query, tid, pf_id):
             parse_mode="Markdown",
         )
 
-        # 2) Detect actual balances + equal target allocation
-        # مثال: تخصيص 100$ و 20 عملة → هدف كل عملة = 5$
+        # 2) انتظار قصير بعد الإلغاء ثم قراءة الرصيد من جديد
+        await asyncio.sleep(1.5)
         presence = client.get_portfolio_presence(symbols)
         min_usdt = float(getattr(config, "BALANCE_PRESENCE_MIN_USDT", 1.0))
         allocated = float(p.investment_usdt or 0)
         n_coins = len(p.coins)
         target_per_coin = allocated / n_coins if n_coins > 0 else 0.0
+        free_usdt = client.get_free_usdt()
 
+        # هدف كل عملة = التخصيص ÷ العدد
+        # أي فرق ≥ 1$ يُشترى من رصيد USDT المتاح في الحساب (حتى من خارج المحفظة)
         coin_status = []  # (coin, amount, price, market_value, need_buy_usdt)
+        total_value = 0.0
+        total_need = 0.0
         for coin in p.coins:
             info = presence.get(coin.symbol) or presence.get(coin.symbol.upper()) or {}
             val = float(info.get("market_value") or 0)
             amt = float(info.get("amount") or 0)
             price = float(info.get("price") or 0)
-            # لو القيمة أقل من 90% من الهدف → نكمّل الفرق
-            if val < target_per_coin * 0.90:
-                need = max(0.0, target_per_coin - val)
-            else:
-                need = 0.0
-            # لو تقريباً صفر نعتبرها ناقصة كاملة
             if amt <= 0 or val < min_usdt:
-                need = target_per_coin
                 val = 0.0
                 amt = 0.0
+            need = max(0.0, target_per_coin - val)
+            # تجاهل فرق أقل من 1$ (غبار)
+            if need < 1.0:
+                need = 0.0
+            total_value += val
+            total_need += need
             coin_status.append((coin, amt, price, val, need))
 
-        under = [x for x in coin_status if x[4] >= 3.0]  # يحتاج شراء ≥ 3$
-        ok_coins = [x for x in coin_status if x[4] < 3.0]
+        under = [x for x in coin_status if x[4] >= 1.0]
+        ok_coins = [x for x in coin_status if x[4] < 1.0]
 
         await query.edit_message_text(
             f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"① أُلغي `{cancelled_count}` أمر قديم\n"
-            f"② التخصيص: `{allocated:.0f}$` ÷ `{n_coins}` = *`{target_per_coin:.2f}$`* لكل عملة\n"
-            f"ناقص/تحت الهدف: `{len(under)}` | مكتمل: `{len(ok_coins)}`\n"
-            "③ إعادة توزيع وشراء الناقص...",
+            f"② هدف كل عملة: *`{target_per_coin:.2f}$`*  (إجمالي `{allocated:.0f}$`)\n"
+            f"القيمة الحالية: `{total_value:.2f}$` | الناقص: `{total_need:.2f}$`\n"
+            f"USDT متاح في الحساب: `{free_usdt:.2f}$`\n"
+            f"يحتاج تكميل: `{len(under)}` | مكتمل: `{len(ok_coins)}`\n"
+            "③ شراء/تكميل من رصيد الحساب...",
             parse_mode="Markdown",
         )
 
-        # 3) Buy the shortfall for each under-allocated coin
+        # 3) تكميل كل عملة تحت الهدف من USDT المتاح (حتى من خارج المحفظة)
         bought = []
         topped = []
         buy_errors = []
-        free_usdt = client.get_free_usdt()
+        total_spent = 0.0
 
         for coin, amt, price, val, need in under:
-            buy_amt = min(need, free_usdt * 0.98)
-            if buy_amt < 3.0:
-                buy_errors.append(f"{coin.symbol}: رصيد USDT غير كافٍ (`{free_usdt:.2f}`)")
+            # حدّث الرصيد الحر قبل كل شراء
+            free_usdt = client.get_free_usdt()
+            buy_amt = min(need, free_usdt * 0.995)
+            if buy_amt < 1.0:
+                buy_errors.append(
+                    f"{coin.symbol}: يحتاج `{need:.2f}$` لكن USDT المتاح `{free_usdt:.2f}$`"
+                )
                 continue
             try:
                 result = await asyncio.get_event_loop().run_in_executor(
@@ -1702,11 +1712,13 @@ async def _do_rebuild_positions(query, tid, pf_id):
                     continue
                 entry = float(result.get("entry_price") or 0)
                 amount = float(result.get("amount") or result.get("remaining_amount") or 0)
+                # بعد الشراء: الكمية الكلية ≈ القديمة + الجديدة
+                new_total_amt = max(amount, client.get_total_amount(coin.symbol) * 0.998)
                 update_coin_position(
                     db, coin.id,
-                    entry_price=entry,
-                    amount=amount,
-                    remaining_amount=amount,
+                    entry_price=entry if entry > 0 else (price or coin.entry_price or 0),
+                    amount=new_total_amt,
+                    remaining_amount=new_total_amt,
                     tp1_price=result.get("tp1_price", 0),
                     tp2_price=result.get("tp2_price", 0),
                     tp3_price=result.get("tp3_price", 0),
@@ -1721,22 +1733,22 @@ async def _do_rebuild_positions(query, tid, pf_id):
                     reentry_touched=False,
                 )
                 mark_reentry_events_used(db, p.id, coin.symbol)
+                total_spent += buy_amt
                 if val < min_usdt:
                     bought.append(coin.symbol)
                 else:
                     topped.append(f"{coin.symbol}(+{buy_amt:.1f}$)")
-                free_usdt = max(0.0, free_usdt - buy_amt)
             except Exception as exc:
                 buy_errors.append(f"{coin.symbol}: {exc}")
-            time.sleep(0.4)
+            time.sleep(0.35)
 
-        # 4) Re-place TP/SL for coins that already had enough balance
+        # 4) إعادة وضع الأهداف للعملات المكتملة مسبقاً
         await query.edit_message_text(
             f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"① أُلغي `{cancelled_count}` أمر\n"
             f"② هدف كل عملة: `{target_per_coin:.2f}$`\n"
-            f"③ اشتريت: `{len(bought)}` | كمّلت: `{len(topped)}`\n"
+            f"③ اشتريت: `{len(bought)}` | كمّلت: `{len(topped)}` | صُرف: `{total_spent:.2f}$`\n"
             "④ إعادة وضع الأهداف للباقي...",
             parse_mode="Markdown",
         )
@@ -1788,27 +1800,33 @@ async def _do_rebuild_positions(query, tid, pf_id):
 
         log_action(
             db, tid, "rebuild_positions",
-            f"Rebuild {p.name}: target={target_per_coin:.2f} cancel={cancelled_count} buy={bought} top={topped}",
+            f"Rebuild {p.name}: target={target_per_coin:.2f} cancel={cancelled_count} "
+            f"buy={bought} top={topped} spent={total_spent:.2f}",
             not (buy_errors or refresh_errors),
             pf_id,
         )
 
+        free_after = client.get_free_usdt()
         # Final report
         lines = [
             f"✅ *تمت إعادة بناء مراكز* `{p.name}`",
             "━━━━━━━━━━━━━━━━━━━━",
-            f"💰 التخصيص: `{allocated:.0f}$` ÷ `{n_coins}` عملة = *`{target_per_coin:.2f}$`* لكل واحدة",
+            f"💰 التخصيص: `{allocated:.0f}$` ÷ `{n_coins}` = *`{target_per_coin:.2f}$`* لكل عملة",
+            f"📊 كانت القيمة: `{total_value:.2f}$` | الناقص: `{total_need:.2f}$`",
             f"🗑 أوامر قديمة ملغاة: `{cancelled_count}`",
             f"🛒 عملات جديدة: `{len(bought)}`" + (f" — {', '.join(f'`{x}`' for x in bought)}" if bought else ""),
             f"📈 تم تكميل: `{len(topped)}`" + (f" — {', '.join(f'`{x}`' for x in topped[:8])}" if topped else ""),
+            f"💵 صُرف من الحساب: `{total_spent:.2f}$` | USDT متبقي: `{free_after:.2f}$`",
             f"🎯 أهداف وُضعت لـ: `{len(refreshed)}` عملة",
             f"TP1 `{tp1}%` · TP2 `{tp2}%` · TP3 `{tp3}%` · SL `{sl_pct}%`",
         ]
         all_errs = cancel_errors[:3] + buy_errors + refresh_errors
         if all_errs:
             lines.append("\n⚠️ ملاحظات:")
-            for e in all_errs[:8]:
+            for e in all_errs[:10]:
                 lines.append(f"• {e}")
+            if any("USDT المتاح" in str(e) for e in buy_errors):
+                lines.append("\n💡 حوّل USDT إضافي للحساب ثم أعد *إعادة بناء المراكز*.")
         await query.edit_message_text(
             "\n".join(lines),
             parse_mode="Markdown",
