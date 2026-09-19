@@ -187,15 +187,20 @@ def format_pf(p, current_value: float = None) -> str:
         pnl = current_value - allocated
         pct = (pnl / allocated) * 100
         emoji = "🟢" if pnl >= 0 else "🔴"
-        pnl_line = f"{emoji} الربح/الخسارة: `{pnl:+.2f}` USDT  (`{pct:+.2f}%`)"
+        pnl_line = f"{emoji} الربح/الخسارة: *{pnl:+.2f}* USDT  (*{pct:+.2f}%*)"
 
-    # العملات في صفوف منظمة (4 في السطر)
+    # العملات في مربعات متناسقة (3 في السطر) بخط سميك
     symbols = [c.symbol for c in p.coins]
     if symbols:
         rows = []
-        for i in range(0, len(symbols), 4):
-            chunk = symbols[i:i + 4]
-            rows.append("  ".join(f"`{s}`" for s in chunk))
+        for i in range(0, len(symbols), 3):
+            chunk = symbols[i:i + 3]
+            # مربع ثابت العرض تقريباً لكل عملة
+            cells = [f"▣ *{s}*" for s in chunk]
+            # لو أقل من 3 في آخر صف نكمل فراغات للتناسق
+            while len(cells) < 3 and i + len(cells) < len(symbols) + 2:
+                break
+            rows.append("   ".join(cells))
         coins_block = "\n".join(rows)
     else:
         coins_block = "—"
@@ -204,13 +209,14 @@ def format_pf(p, current_value: float = None) -> str:
         f"📁 *{p.name}*  `#{p.id}`",
         "━━━━━━━━━━━━━━━━━━━━",
         f"الحالة: *{status}*",
-        f"المخصص: `{allocated:.2f}` USDT",
+        f"المخصص: *{allocated:.2f}* USDT",
     ]
     if current_value is not None:
-        lines.append(f"القيمة الحالية: `{current_value:.2f}` USDT")
+        lines.append(f"القيمة الحالية: *{current_value:.2f}* USDT")
     if pnl_line:
         lines.append(pnl_line)
-    lines.append(f"العملات ({len(symbols)}):")
+    lines.append("")
+    lines.append(f"*العملات* ({len(symbols)})")
     lines.append(coins_block)
     return "\n".join(lines)
 

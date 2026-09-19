@@ -188,14 +188,19 @@ class MexcClient:
         }
 
     def get_coins_value(self, symbols: List[str]) -> Dict:
-        """Value of specific coins only (for a virtual portfolio)."""
-        balances = self.get_balance()
+        """Value of specific coins only (for a virtual portfolio).
+
+        Uses total balance (free + locked in open orders) so that coins
+        sitting in TP limit-sell orders are still counted correctly.
+        """
+        balances = self.get_total_balance()
         prices = self.get_all_prices(symbols)
         total = 0.0
         details = {}
         for s in symbols:
-            amount = float(balances.get(s, 0.0))
-            price = prices.get(s, 0.0)
+            key = self.normalize_asset_symbol(s)
+            amount = float(balances.get(key, 0.0) or balances.get(s, 0.0))
+            price = float(prices.get(key, 0.0) or prices.get(s, 0.0))
             usdt_value = amount * price
             total += usdt_value
             details[s] = {
