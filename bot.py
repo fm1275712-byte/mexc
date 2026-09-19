@@ -76,42 +76,52 @@ async def ensure_admin(update: Update) -> bool:
     if not user or not is_admin(user.id):
         msg = update.effective_message
         if msg:
-            await msg.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
+            await msg.reply_text("⛔ *غير مصرح*\nهذا البوت مخصص للأدمن فقط.", parse_mode="Markdown")
         return False
     return True
 
 
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 محافظي", callback_data="list_pf")],
-        [InlineKeyboardButton("➕ محفظة جديدة", callback_data="create_pf")],
-        [InlineKeyboardButton("📡 مصادر الإشارات", callback_data="list_sources")],
-        [InlineKeyboardButton("💰 الرصيد", callback_data="balance")],
-        [InlineKeyboardButton("🧹 تنظيف قاعدة البيانات", callback_data="cleanup_db")],
-        [InlineKeyboardButton("⚙️ إعدادات", callback_data="settings")],
+        [
+            InlineKeyboardButton("📋 محافظي", callback_data="list_pf"),
+            InlineKeyboardButton("➕ محفظة جديدة", callback_data="create_pf"),
+        ],
+        [
+            InlineKeyboardButton("📡 مصادر الإشارات", callback_data="list_sources"),
+            InlineKeyboardButton("💰 الرصيد", callback_data="balance"),
+        ],
+        [
+            InlineKeyboardButton("🧹 تنظيف القاعدة", callback_data="cleanup_db"),
+            InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings"),
+        ],
     ])
 
 
 def pf_keyboard(pf_id: int, is_running: bool):
     rows = []
     if is_running:
-        rows.append([InlineKeyboardButton("⏹ إيقاف", callback_data=f"stop_{pf_id}")])
+        rows.append([InlineKeyboardButton("⏹ إيقاف المحفظة", callback_data=f"stop_{pf_id}")])
     else:
-        rows.append([InlineKeyboardButton("▶️ تشغيل", callback_data=f"start_{pf_id}")])
-    rows.append([InlineKeyboardButton("📈 زيادة استثمار", callback_data=f"increase_{pf_id}")])
-    rows.append([InlineKeyboardButton("🎯 أهداف هذه المحفظة", callback_data=f"pf_tpsl_{pf_id}")])
-    rows.append([InlineKeyboardButton("🔄 تحديث الأهداف والاستوب", callback_data=f"refresh_tpsl_{pf_id}")])
+        rows.append([InlineKeyboardButton("▶️ تشغيل المحفظة", callback_data=f"start_{pf_id}")])
     rows.append([
-        InlineKeyboardButton("🛑 الاستوبات / إعادة الدخول", callback_data=f"stopped_{pf_id}"),
-        InlineKeyboardButton("📊 إحصائيات الربح والخسارة", callback_data=f"stats_{pf_id}"),
+        InlineKeyboardButton("📈 زيادة رأس المال", callback_data=f"increase_{pf_id}"),
+        InlineKeyboardButton("🎯 أهداف TP/SL", callback_data=f"pf_tpsl_{pf_id}"),
     ])
-    rows.append([InlineKeyboardButton("🔎 فحص العملات الناقصة", callback_data=f"missing_{pf_id}")])
+    rows.append([
+        InlineKeyboardButton("🔄 تحديث الأهداف", callback_data=f"refresh_tpsl_{pf_id}"),
+        InlineKeyboardButton("📊 الإحصائيات", callback_data=f"stats_{pf_id}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("🛑 الاستوبات / إعادة دخول", callback_data=f"stopped_{pf_id}"),
+        InlineKeyboardButton("🔎 عملات ناقصة", callback_data=f"missing_{pf_id}"),
+    ])
     rows.append([
         InlineKeyboardButton("➕ عملة", callback_data=f"addcoin_{pf_id}"),
         InlineKeyboardButton("➖ عملة", callback_data=f"removecoin_{pf_id}"),
     ])
     rows.append([InlineKeyboardButton("🗑 حذف المحفظة", callback_data=f"close_{pf_id}")])
-    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="list_pf")])
+    rows.append([InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="list_pf")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -147,31 +157,34 @@ def sources_keyboard(sources):
     for s in sources:
         icon = "🟢" if s.enabled else "🔴"
         buttons.append([InlineKeyboardButton(f"{icon} {s.name}", callback_data=f"view_src_{s.id}")])
-    buttons.append([InlineKeyboardButton("➕ مصدر جديد", callback_data="create_src")])
-    buttons.append([InlineKeyboardButton("⬅️ القائمة", callback_data="menu")])
+    buttons.append([InlineKeyboardButton("➕ إضافة مصدر جديد", callback_data="create_src")])
+    buttons.append([InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="menu")])
     return InlineKeyboardMarkup(buttons)
 
 
 def source_detail_keyboard(src_id: int, enabled: bool):
     rows = []
     if enabled:
-        rows.append([InlineKeyboardButton("⏹ تعطيل", callback_data=f"toggle_src_{src_id}")])
+        rows.append([InlineKeyboardButton("⏹ تعطيل المصدر", callback_data=f"toggle_src_{src_id}")])
     else:
-        rows.append([InlineKeyboardButton("▶️ تفعيل", callback_data=f"toggle_src_{src_id}")])
-    rows.append([InlineKeyboardButton("✏️ تعديل", callback_data=f"edit_src_{src_id}")])
-    rows.append([InlineKeyboardButton("🗑 حذف المصدر", callback_data=f"del_src_{src_id}")])
-    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="list_sources")])
+        rows.append([InlineKeyboardButton("▶️ تفعيل المصدر", callback_data=f"toggle_src_{src_id}")])
+    rows.append([
+        InlineKeyboardButton("✏️ تعديل", callback_data=f"edit_src_{src_id}"),
+        InlineKeyboardButton("🗑 حذف", callback_data=f"del_src_{src_id}"),
+    ])
+    rows.append([InlineKeyboardButton("⬅️ رجوع للمصادر", callback_data="list_sources")])
     return InlineKeyboardMarkup(rows)
 
 
 def format_pf(p) -> str:
     coins = ", ".join(c.symbol for c in p.coins) or "—"
-    status = "🟢 شغالة" if p.is_running else "⚪ متوقفة"
+    status = "🟢 *شغالة*" if p.is_running else "⚪ *متوقفة*"
     lines = [
-        f"📁 *{p.name}* (#{p.id})",
+        f"📁 *{p.name}*  `#{p.id}`",
+        "━━━━━━━━━━━━━━━━",
         f"الحالة: {status}",
         f"المخصص: `{p.investment_usdt:.2f}` USDT",
-        f"العملات: `{coins}`",
+        f"العملات ({len(p.coins)}): `{coins}`",
     ]
     # show portfolio-specific TP/SL if set
     t1 = getattr(p, "tp1_pct", None)
@@ -180,12 +193,14 @@ def format_pf(p) -> str:
     sl = getattr(p, "stop_loss_pct", None)
     if any(v is not None and v > 0 for v in (t1, t2, t3, sl)):
         lines.append(
-            f"🎯 أهداف المحفظة: TP1 `{t1 or '—'}`% | TP2 `{t2 or '—'}`% | "
-            f"TP3 `{t3 or '—'}`% | SL `{sl or '—'}%`"
+            f"🎯 أهداف: TP1 `{t1 or '—'}%` · TP2 `{t2 or '—'}%` · "
+            f"TP3 `{t3 or '—'}%` · SL `{sl or '—'}%`"
         )
     else:
         lines.append("🎯 الأهداف: *من الإعدادات العامة*")
     if p.is_running:
+        lines.append("")
+        lines.append("*المراكز المفتوحة:*")
         for c in p.coins:
             if c.position_status in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit") and c.entry_price:
                 st_map = {
@@ -197,10 +212,10 @@ def format_pf(p) -> str:
                 }
                 st = st_map.get(c.position_status, c.position_status)
                 lines.append(
-                    f"  `{c.symbol}` دخول `{c.entry_price:.6g}`\n"
-                    f"    TP1 `{getattr(c,'tp1_price',0):.6g}` | TP2 `{getattr(c,'tp2_price',0):.6g}` | "
+                    f"• `{c.symbol}` دخول `{c.entry_price:.6g}`\n"
+                    f"  TP1 `{getattr(c,'tp1_price',0):.6g}` · TP2 `{getattr(c,'tp2_price',0):.6g}` · "
                     f"TP3 `{getattr(c,'tp3_price',0):.6g}`\n"
-                    f"    استوب `{c.current_sl_price:.6g}` ({st})"
+                    f"  🛑 استوب `{c.current_sl_price:.6g}` ({st})"
                 )
     return "\n".join(lines)
 
@@ -224,15 +239,21 @@ def format_portfolio_stats(p, events, prices=None) -> str:
         value = remaining * price
         open_cost += cost
         open_value += value
-        open_lines.append(f"`{coin.symbol}`: {value - cost:+.2f} USDT")
+        pnl = value - cost
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        open_lines.append(f"{emoji} `{coin.symbol}`: `{pnl:+.2f}` USDT")
     unrealized = open_value - open_cost
     total = realized + unrealized
+    r_emoji = "🟢" if realized >= 0 else "🔴"
+    u_emoji = "🟢" if unrealized >= 0 else "🔴"
+    t_emoji = "🟢" if total >= 0 else "🔴"
     result = (
-        f"📊 *إحصائيات محفظة {p.name}*\n\n"
-        f"المحقق: `{realized:+.2f}` USDT\n"
-        f"غير المحقق: `{unrealized:+.2f}` USDT\n"
-        f"الإجمالي: `{total:+.2f}` USDT\n"
-        f"عدد العمليات المسجلة: `{len(events)}`"
+        f"📊 *إحصائيات محفظة {p.name}*\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"{r_emoji} المحقق: `{realized:+.2f}` USDT\n"
+        f"{u_emoji} غير المحقق: `{unrealized:+.2f}` USDT\n"
+        f"{t_emoji} *الإجمالي: `{total:+.2f}` USDT*\n"
+        f"عدد العمليات: `{len(events)}`"
     )
     if open_lines:
         result += "\n\n*المراكز المفتوحة:*\n" + "\n".join(open_lines)
@@ -240,13 +261,15 @@ def format_portfolio_stats(p, events, prices=None) -> str:
 
 
 def format_source(s) -> str:
+    status = "🟢 *مفعل*" if s.enabled else "🔴 *معطل*"
     return (
-        f"📡 *{s.name}* (#{s.id})\n"
-        f"الحالة: {'🟢 مفعل' if s.enabled else '🔴 معطل'}\n"
-        f"الحد الأدنى: `{s.min_usd:,.0f}$`\n"
+        f"📡 *{s.name}*  `#{s.id}`\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"الحالة: {status}\n"
+        f"الحد الأدنى: `{s.min_usd:,.0f}` $\n"
         f"أقصى تحويلات: `{s.max_tx_count}`\n"
-        f"شراء مسموح: {'نعم' if s.allow_buy else 'لا'}\n"
-        f"بيع مسموح: {'نعم' if s.allow_sell else 'لا'}\n"
+        f"شراء: {'✅ مسموح' if s.allow_buy else '❌ ممنوع'}\n"
+        f"بيع: {'✅ مسموح' if s.allow_sell else '❌ ممنوع'}\n"
         f"محافظ الشراء: `{s.buy_portfolio_ids or '—'}`\n"
         f"محافظ البيع: `{s.sell_portfolio_ids or '—'}`\n"
         f"التبريد: `{s.cooldown_minutes}` دقيقة"
@@ -656,7 +679,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         db.close()
     await update.message.reply_text(
-        "👋 *MEXC Portfolio Manager + Signal Engine*\n\nإدارة محافظك + تنفيذ إشارات ذكية من المجموعة.",
+        "🚀 *MEXC Portfolio Manager*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "إدارة محافظ متعددة + نظام إشارات ذكي\n"
+        "تنفيذ تلقائي من المجموعة • أهداف ربح ووقف خسارة\n\n"
+        "اختر من القائمة أدناه 👇",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
@@ -664,8 +691,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("تم الإلغاء.", reply_markup=ReplyKeyboardRemove())
-    await update.message.reply_text("القائمة الرئيسية:", reply_markup=main_menu_keyboard())
+    await update.message.reply_text(
+        "❎ تم الإلغاء.\nرجعت للقائمة الرئيسية 👇",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text(
+        "🏠 *القائمة الرئيسية*",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )
     return ConversationHandler.END
 
 
@@ -1014,7 +1048,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
 
     if data == "menu":
-        await query.edit_message_text("القائمة الرئيسية:", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(
+            "🏠 *القائمة الرئيسية*\nاختر ما تريد:",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     if data == "list_pf":
@@ -1022,11 +1060,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             pfs = get_portfolios(db, tid, status="active")
             if not pfs:
-                await query.edit_message_text("لا توجد محافظ نشطة.\nاضغط ➕ لإنشاء محفظة.", reply_markup=main_menu_keyboard())
+                await query.edit_message_text(
+                    "📭 لا توجد محافظ نشطة حالياً.\nاضغط ➕ *محفظة جديدة* للبدء.",
+                    parse_mode="Markdown",
+                    reply_markup=main_menu_keyboard(),
+                )
                 return
-            buttons = [[InlineKeyboardButton(f"{'🟢' if p.is_running else '⚪'} #{p.id} {p.name} ({p.investment_usdt:.0f}$)", callback_data=f"view_{p.id}")] for p in pfs]
-            buttons.append([InlineKeyboardButton("⬅️ القائمة", callback_data="menu")])
-            await query.edit_message_text("📋 *محافظك النشطة:*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+            buttons = [
+                [InlineKeyboardButton(
+                    f"{'🟢' if p.is_running else '⚪'} #{p.id} {p.name} · {p.investment_usdt:.0f}$",
+                    callback_data=f"view_{p.id}",
+                )]
+                for p in pfs
+            ]
+            buttons.append([InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="menu")])
+            await query.edit_message_text(
+                f"📋 *محافظك النشطة* ({len(pfs)})\n━━━━━━━━━━━━━━━━",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
         finally:
             db.close()
         return

@@ -117,15 +117,33 @@ class MexcClient:
         return float(ticker['last'])
 
     def get_all_prices(self, symbols: List[str]) -> Dict[str, float]:
-        """symbols = ['BTC', 'ETH'] -> prices in USDT"""
-        prices = {}
-        for s in symbols:
-            pair = f"{s}/{self.quote}"
-            try:
-                prices[s] = self.get_ticker_price(pair)
-            except Exception:
-                prices[s] = 0.0
-        prices[self.quote] = 1.0
+        """symbols = ['BTC', 'ETH'] -> prices in USDT.
+        Uses batch fetch_tickers when possible for much higher speed.
+        """
+        prices: Dict[str, float] = {self.quote: 1.0}
+        if not symbols:
+            return prices
+
+        unique = list(dict.fromkeys(
+            self.normalize_asset_symbol(s) for s in symbols if s
+        ))
+        pairs = [f"{s}/{self.quote}" for s in unique]
+
+        # Batch request — dramatically faster than sequential fetch_ticker
+        try:
+            tickers = self.exchange.fetch_tickers(pairs)
+            for s, pair in zip(unique, pairs):
+                t = tickers.get(pair) or {}
+                last = t.get("last") or t.get("close")
+                prices[s] = float(last) if last is not None else 0.0
+        except Exception:
+            # Fallback to sequential if batch fails
+            for s in unique:
+                pair = f"{s}/{self.quote}"
+                try:
+                    prices[s] = self.get_ticker_price(pair)
+                except Exception:
+                    prices[s] = 0.0
         return prices
 
     def get_portfolio_value(self) -> Dict:
