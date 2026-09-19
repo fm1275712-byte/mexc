@@ -109,6 +109,9 @@ def pf_keyboard(pf_id: int, is_running: bool):
         InlineKeyboardButton("🎯 أهداف TP/SL", callback_data=f"pf_tpsl_{pf_id}"),
     ])
     rows.append([
+        InlineKeyboardButton("♻️ إعادة بناء المراكز", callback_data=f"rebuild_{pf_id}"),
+    ])
+    rows.append([
         InlineKeyboardButton("🔄 تحديث الأهداف", callback_data=f"refresh_tpsl_{pf_id}"),
         InlineKeyboardButton("📊 الإحصائيات", callback_data=f"stats_{pf_id}"),
     ])
@@ -1300,6 +1303,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("refresh_tpsl_"):
         await _do_refresh_tpsl(query, tid, int(data.split("_")[2]))
         return
+
+    if data.startswith("rebuild_"):
+        await _do_rebuild_positions(query, tid, int(data.split("_")[1]))
+        return
+        return
     if data.startswith("reentry_"):
         await _do_manual_reentry(query, tid, int(data.split("_")[1]))
         return
@@ -1533,6 +1541,267 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
         return EDIT_SRC_VALUE
+
+
+async def _do_rebuild_positions(query, tid, pf_id):
+    """دورة كاملة داخل المحفظة:
+    1) إلغاء كل أوامر البيع القديمة من المنصة + مسحها من القاعدة
+    2) التعرف على الرصيد الفعلي
+    3) شراء العملات الناقصة
+    4) إعادة وضع أهداف TP/SL الجديدة
+    """
+    import asyncio
+    import time
+
+    db = SessionLocal()
+    try:
+        p = get_portfolio(db, pf_id, tid)
+        if not p:
+            await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
+            return
+        if not p.is_running:
+            await query.edit_message_text(
+                "⚠️ المحفظة متوقفة.\nشغّلها أولاً ثم استخدم *إعادة بناء المراكز*.",
+                parse_mode="Markdown",
+                reply_markup=pf_keyboard(pf_id, False),
+            )
+            return
+        if not p.coins:
+            await query.edit_message_text(
+                "لا توجد عملات في هذه المحفظة.",
+                reply_markup=pf_keyboard(pf_id, True),
+            )
+            return
+
+        user = get_or_create_user(db, tid)
+
+        def pct(pf_val, user_val, default):
+            if pf_val is not None and float(pf_val) > 0:
+                return float(pf_val)
+            if user_val is not None and float(user_val) > 0:
+                return float(user_val)
+            return default
+
+        tp1 = pct(getattr(p, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
+        tp2 = pct(getattr(p, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
+        tp3 = pct(getattr(p, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
+        s1 = pct(getattr(p, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
+        s2 = pct(getattr(p, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 30.0)
+        sl_pct = pct(getattr(p, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
+
+        await query.edit_message_text(
+            f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "① إلغاء الأهداف القديمة من المنصة...",
+            parse_mode="Markdown",
+        )
+
+        client = get_mexc()
+        reb = get_reb()
+        symbols = [c.symbol for c in p.coins]
+        cancelled_count = 0
+        cancel_errors = []
+
+        # 1) Cancel DB-known TP orders + any open sells on exchange
+        for coin in p.coins:
+            try:
+                res = reb.cancel_tp_orders([{
+                    "symbol": coin.symbol,
+                    "tp_order_id": getattr(coin, "tp_order_id", None),
+                    "tp1_order_id": getattr(coin, "tp1_order_id", None),
+                    "tp2_order_id": getattr(coin, "tp2_order_id", None),
+                    "tp3_order_id": getattr(coin, "tp3_order_id", None),
+                }])
+                cancelled_count += len(res.get("cancelled") or [])
+                for e in res.get("errors") or []:
+                    cancel_errors.append(f"{coin.symbol}: {e.get('error', e)}")
+            except Exception as exc:
+                cancel_errors.append(f"{coin.symbol}: {exc}")
+            try:
+                extra = client.cancel_all_open_sells(coin.symbol)
+                cancelled_count += len(extra.get("cancelled") or [])
+            except Exception:
+                pass
+            # Clear order IDs from DB immediately
+            update_coin_position(
+                db, coin.id,
+                tp_order_id=None,
+                tp1_order_id=None,
+                tp2_order_id=None,
+                tp3_order_id=None,
+            )
+
+        await asyncio.sleep(1.0)
+        await query.edit_message_text(
+            f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"① أُلغي `{cancelled_count}` أمر قديم\n"
+            "② فحص الرصيد الفعلي...",
+            parse_mode="Markdown",
+        )
+
+        # 2) Detect actual balances
+        presence = client.get_portfolio_presence(symbols)
+        min_usdt = float(getattr(config, "BALANCE_PRESENCE_MIN_USDT", 1.0))
+        present = []
+        missing = []
+        for coin in p.coins:
+            info = presence.get(coin.symbol) or presence.get(coin.symbol.upper()) or {}
+            val = float(info.get("market_value") or 0)
+            amt = float(info.get("amount") or 0)
+            if amt > 0 and val >= min_usdt:
+                present.append((coin, amt, float(info.get("price") or 0), val))
+            else:
+                missing.append(coin)
+
+        # 3) Buy missing coins with remaining capital
+        bought = []
+        buy_errors = []
+        allocated = float(p.investment_usdt or 0)
+        current_total = sum(v for _, _, _, v in present)
+        remaining_budget = max(0.0, allocated - current_total)
+
+        if missing and remaining_budget >= 5.0:
+            per_coin = remaining_budget / len(missing)
+            # Don't buy if share is too tiny
+            if per_coin < 3.0:
+                buy_errors.append(f"الميزانية المتبقية `{remaining_budget:.2f}$` صغيرة جداً لـ {len(missing)} عملة")
+            else:
+                await query.edit_message_text(
+                    f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"① أُلغي `{cancelled_count}` أمر\n"
+                    f"② موجودة: `{len(present)}` | ناقصة: `{len(missing)}`\n"
+                    f"③ شراء الناقص (`{per_coin:.2f}$` لكل عملة)...",
+                    parse_mode="Markdown",
+                )
+                for coin in missing:
+                    try:
+                        result = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda c=coin, amt=per_coin: reb.reentry_buy_and_place_tp(
+                                c.symbol, amt, tp1, tp2, tp3, sl_pct, s1, s2,
+                            ),
+                        )
+                        if result.get("error"):
+                            buy_errors.append(f"{coin.symbol}: {result['error']}")
+                            continue
+                        entry = float(result.get("entry_price") or 0)
+                        amount = float(result.get("amount") or result.get("remaining_amount") or 0)
+                        update_coin_position(
+                            db, coin.id,
+                            entry_price=entry,
+                            amount=amount,
+                            remaining_amount=amount,
+                            tp1_price=result.get("tp1_price", 0),
+                            tp2_price=result.get("tp2_price", 0),
+                            tp3_price=result.get("tp3_price", 0),
+                            tp_price=result.get("tp1_price", 0),
+                            current_sl_price=result.get("sl_price", 0),
+                            original_sl_price=result.get("original_sl_price", 0),
+                            tp1_order_id=result.get("tp1_order_id"),
+                            tp2_order_id=result.get("tp2_order_id"),
+                            tp3_order_id=result.get("tp3_order_id"),
+                            position_status="open",
+                            reentry_used=False,
+                            reentry_touched=False,
+                        )
+                        mark_reentry_events_used(db, p.id, coin.symbol)
+                        bought.append(coin.symbol)
+                        present.append((coin, amount, entry, amount * entry if entry else 0))
+                    except Exception as exc:
+                        buy_errors.append(f"{coin.symbol}: {exc}")
+                    time.sleep(0.4)
+
+        # 4) Re-place TP/SL for coins that already had balance (and weren't just bought)
+        await query.edit_message_text(
+            f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"① أُلغي `{cancelled_count}` أمر\n"
+            f"② موجودة: `{len(present)}` | اشتريت: `{len(bought)}`\n"
+            "④ إعادة وضع الأهداف...",
+            parse_mode="Markdown",
+        )
+
+        refreshed = []
+        refresh_errors = []
+        bought_set = set(bought)
+        for coin, amt, price, val in present:
+            if coin.symbol in bought_set:
+                refreshed.append(coin.symbol)  # already placed during buy
+                continue
+            try:
+                # Prefer free amount for placing new limits; unlock first already done
+                free_amt = client.get_free_amount(coin.symbol)
+                use_amt = free_amt if free_amt > 0 else amt
+                use_amt = use_amt * 0.998
+                entry = float(coin.entry_price or 0)
+                if entry <= 0:
+                    entry = price or client.get_ticker_price(f"{coin.symbol}/{client.quote}")
+                if use_amt <= 0 or entry <= 0:
+                    refresh_errors.append(f"{coin.symbol}: لا يوجد رصيد كافٍ")
+                    continue
+                result = reb.place_tp_orders(
+                    [{"symbol": coin.symbol, "amount": use_amt, "entry_price": entry}],
+                    tp1, tp2, tp3, sl_pct, s1, s2,
+                )[0]
+                if result.get("error"):
+                    refresh_errors.append(f"{coin.symbol}: {result['error']}")
+                update_coin_position(
+                    db, coin.id,
+                    entry_price=entry,
+                    amount=use_amt,
+                    remaining_amount=use_amt,
+                    tp1_price=result.get("tp1_price", 0),
+                    tp2_price=result.get("tp2_price", 0),
+                    tp3_price=result.get("tp3_price", 0),
+                    tp_price=result.get("tp1_price", 0),
+                    current_sl_price=result.get("sl_price", 0),
+                    original_sl_price=result.get("original_sl_price", 0),
+                    tp1_order_id=result.get("tp1_order_id"),
+                    tp2_order_id=result.get("tp2_order_id"),
+                    tp3_order_id=result.get("tp3_order_id"),
+                    position_status="open",
+                )
+                refreshed.append(coin.symbol)
+            except Exception as exc:
+                refresh_errors.append(f"{coin.symbol}: {exc}")
+
+        log_action(
+            db, tid, "rebuild_positions",
+            f"Rebuild {p.name}: cancel={cancelled_count} buy={bought} refresh={refreshed}",
+            not (buy_errors or refresh_errors),
+            pf_id,
+        )
+
+        # Final report
+        lines = [
+            f"✅ *تمت إعادة بناء مراكز* `{p.name}`",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"🗑 أوامر قديمة ملغاة: `{cancelled_count}`",
+            f"🛒 عملات اشتريت: `{len(bought)}`" + (f" — {', '.join(f'`{x}`' for x in bought)}" if bought else ""),
+            f"🎯 أهداف وُضعت لـ: `{len(refreshed)}`" + (f" — {', '.join(f'`{x}`' for x in refreshed[:12])}" if refreshed else ""),
+            f"القيم: TP1 `{tp1}%` · TP2 `{tp2}%` · TP3 `{tp3}%` · SL `{sl_pct}%`",
+        ]
+        all_errs = cancel_errors[:3] + buy_errors + refresh_errors
+        if all_errs:
+            lines.append("\n⚠️ ملاحظات:")
+            for e in all_errs[:8]:
+                lines.append(f"• {e}")
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=pf_keyboard(pf_id, True),
+        )
+    except Exception as exc:
+        logger.exception("rebuild_positions failed")
+        await query.edit_message_text(
+            f"❌ فشل إعادة البناء:\n`{exc}`",
+            parse_mode="Markdown",
+            reply_markup=pf_keyboard(pf_id, True),
+        )
+    finally:
+        db.close()
 
 
 async def _do_refresh_tpsl(query, tid, pf_id):

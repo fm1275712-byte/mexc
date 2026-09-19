@@ -258,14 +258,34 @@ class MexcClient:
         return sorted(set(bases))
 
     def create_limit_sell(self, symbol: str, amount: float, price: float) -> Optional[dict]:
-        """Place a limit sell order (used for Take Profit visible on MEXC)."""
+        """Place a limit sell order (used for Take Profit visible on MEXC).
+
+        Returns None (without raising) when the amount is below the exchange
+        minimum precision so tiny dust positions do not spam errors.
+        """
         pair = f"{symbol}/{self.quote}"
         try:
-            # Round to exchange precision
+            # Ensure markets are loaded for precision checks
+            if not getattr(self.exchange, "markets", None):
+                self.exchange.load_markets()
+            market = self.exchange.market(pair)
+            min_amount = float((market.get("limits") or {}).get("amount", {}).get("min") or 0)
+            precision_amount = market.get("precision", {}).get("amount")
+            # Round down to exchange precision
             amount = float(self.exchange.amount_to_precision(pair, amount))
             price = float(self.exchange.price_to_precision(pair, price))
             if amount <= 0 or price <= 0:
-                raise Exception(f"Invalid amount/price for {pair}: {amount} @ {price}")
+                return None
+            if min_amount > 0 and amount < min_amount:
+                return None
+            # Some MEXC pairs treat precision as minimum step
+            if precision_amount is not None:
+                try:
+                    step = float(precision_amount)
+                    if 0 < step < 1 and amount < step:
+                        return None
+                except (TypeError, ValueError):
+                    pass
             order = self.exchange.create_order(
                 symbol=pair,
                 type='limit',
@@ -275,6 +295,10 @@ class MexcClient:
             )
             return order
         except Exception as e:
+            msg = str(e).lower()
+            # Treat precision / minimum amount errors as skippable
+            if any(x in msg for x in ("minimum amount", "min amount", "precision", "too small")):
+                return None
             raise Exception(f"Limit sell failed for {pair}: {str(e)}")
 
     def cancel_order(self, order_id: str, symbol: str, strict: bool = False) -> Optional[dict]:
@@ -316,4 +340,29 @@ class MexcClient:
     def get_free_amount(self, symbol: str) -> float:
         """Free balance of a base asset."""
         bal = self.get_balance()
-        return float(bal.get(symbol, 0.0))
+        key = self.normalize_asset_symbol(symbol)
+        return float(bal.get(key, 0.0) or bal.get(symbol, 0.0))
+
+    def get_total_amount(self, symbol: str) -> float:
+        """Total balance (free + locked in open orders) of a base asset."""
+        bal = self.get_total_balance()
+        key = self.normalize_asset_symbol(symbol)
+        return float(bal.get(key, 0.0) or bal.get(symbol, 0.0))
+
+    def cancel_all_open_sells(self, symbol: str) -> Dict:
+        """Cancel every open sell order for a symbol on the exchange."""
+        result = {"cancelled": [], "errors": []}
+        try:
+            orders = self.fetch_open_sell_orders(symbol)
+            for order in orders:
+                oid = order.get("id")
+                if not oid:
+                    continue
+                try:
+                    self.cancel_order(str(oid), symbol, strict=False)
+                    result["cancelled"].append(str(oid))
+                except Exception as exc:
+                    result["errors"].append({"order_id": str(oid), "error": str(exc)})
+        except Exception as exc:
+            result["errors"].append({"error": str(exc)})
+        return result

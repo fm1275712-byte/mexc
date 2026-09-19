@@ -145,7 +145,11 @@ class Rebalancer:
             amount = float(item.get("amount") or 0)
             entry = float(item.get("entry_price") or 0)
             if amount <= 0:
-                amount = self.client.get_free_amount(symbol) * 0.998
+                # Prefer free; fall back to total (locked in old orders may still exist)
+                amount = self.client.get_free_amount(symbol)
+                if amount <= 0:
+                    amount = self.client.get_total_amount(symbol)
+                amount = amount * 0.998
             if entry <= 0:
                 entry = self.client.get_ticker_price(f"{symbol}/{self.quote}")
             if amount <= 0 or entry <= 0:
@@ -172,9 +176,12 @@ class Rebalancer:
                     continue
                 try:
                     order = self.client.create_limit_sell(symbol, qty, price)
+                    if order is None:
+                        # Amount below exchange minimum — skip quietly
+                        continue
                     orders[key] = order.get("id") if order else None
                 except Exception as e:
-                    logger.exception(f"{key} failed for {symbol}")
+                    logger.warning(f"{key} failed for {symbol}: {e}")
                     errors.append(f"{key}: {e}")
 
             results.append({
